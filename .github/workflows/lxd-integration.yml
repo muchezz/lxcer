@@ -17,6 +17,12 @@ on:
       pool:
         description: Storage pool on the disposable host
         required: true
+      expected_version:
+        description: Expected LXD version (3.0.3, 4.0, 5.0 or 6)
+        required: true
+      expected_driver:
+        description: Expected pool driver (btrfs, zfs, lvm, dir or ceph)
+        required: true
 permissions:
   contents: read
 jobs:
@@ -36,4 +42,6 @@ jobs:
           LXCER_TEST_PROFILE: ${{ inputs.profile }}
           LXCER_TEST_IMAGE: ${{ inputs.image }}
           LXCER_TEST_POOL: ${{ inputs.pool }}
+          LXCER_TEST_EXPECT_VERSION: ${{ inputs.expected_version }}
+          LXCER_TEST_EXPECT_DRIVER: ${{ inputs.expected_driver }}
         run: go test -tags=lxdintegration -run '^TestIsolatedLXD$' -v -timeout 40m ./...

@@ -16,14 +16,23 @@ func TestIsolatedLXD(t *testing.T) {
 	remote := os.Getenv("LXCER_TEST_REMOTE")
 	profile := os.Getenv("LXCER_TEST_PROFILE")
 	image := os.Getenv("LXCER_TEST_IMAGE")
-	if os.Getenv("LXCER_TEST_DISPOSABLE") != "YES" || !strings.HasPrefix(remote, "lxcer-test-") || !validName(remote) || !validName(profile) || image == "" {
-		t.Skip("requires explicitly disposable lxcer-test-* remote, root-only profile, and test image")
+	if os.Getenv("LXCER_TEST_DISPOSABLE") != "YES" {
+		t.Skip("NOT VERIFIED: disposable integration was not enabled")
+	}
+	if !strings.HasPrefix(remote, "lxcer-test-") || !validName(remote) || !validName(profile) || image == "" {
+		t.Fatal("requires explicitly disposable lxcer-test-* remote, root-only profile, and test image")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 	r := ExecRunner{}
 	l := LXD{R: r, Host: remote}
 	if er := l.Detect(ctx); er != nil {
+		t.Fatal(er)
+	}
+	if expected := os.Getenv("LXCER_TEST_EXPECT_VERSION"); expected != "" && l.Caps.Server != expected && !strings.HasPrefix(l.Caps.Server, expected+".") {
+		t.Fatalf("NOT VERIFIED: expected server %s, got %s", expected, l.Caps.Server)
+	}
+	if er := requireRootProfile(ctx, l, profile); er != nil {
 		t.Fatal(er)
 	}
 	f := fake()
@@ -63,6 +72,21 @@ func TestIsolatedLXD(t *testing.T) {
 			}
 			if _, er = l.run(ctx, "exec", l.ref(name), "--", "touch", "/root/lxcer-verification"); er != nil {
 				t.Fatal(er)
+			}
+		}
+		cc, er := l.List(ctx)
+		if er != nil {
+			t.Fatal(er)
+		}
+		for _, c := range cc {
+			if c.Name == name {
+				driver, err := l.Storage(ctx, c)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if expected := os.Getenv("LXCER_TEST_EXPECT_DRIVER"); expected != "" && driver != expected {
+					t.Fatalf("NOT VERIFIED: expected driver %s got %s", expected, driver)
+				}
 			}
 		}
 		if er = e.Backup(ctx, []Host{{Name: remote}}, name); er != nil {
