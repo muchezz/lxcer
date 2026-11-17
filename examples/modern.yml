@@ -1,0 +1,43 @@
+version: 1
+state_dir: ./lxcer-state
+workers: 4
+timeout: 2h
+retries: 2
+bandwidth_kib: 8192
+compression: none
+min_free_bytes: 10737418240
+# Parent directory must exist; use node_exporter's textfile collector.
+# metrics_file: /var/lib/node_exporter/textfile_collector/lxcer.prom
+policy:
+  strategy: auto
+inventory:
+  - name: local
+    workers: 2
+    instances:
+      database:
+        hooks:
+          pre:
+            - argv: [/usr/local/sbin/lxcer-database-dump]
+              timeout: 20m
+          quiesce:
+            - argv: [/usr/local/sbin/lxcer-quiesce]
+              timeout: 2m
+          resume:
+            - argv: [/usr/local/sbin/lxcer-resume]
+              timeout: 2m
+  - name: backup-agent
+    ssh: backup-agent
+    remote_config: /etc/lxcer/agent.yml
+    workers: 1
+destinations:
+  - name: primary
+    path: /srv/restic/lxcer
+    password_env: LXCER_RESTIC_PASSWORD
+    check: true
+    keep_last: 7
+    keep_daily: 14
+    keep_weekly: 8
+  - name: offsite
+    path: sftp:storagebox:/home/lxcer
+    password_file: /etc/lxcer/offsite-password
+    optional: true

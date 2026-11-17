@@ -1,0 +1,11 @@
+[Unit]
+Description=lxcer scheduled backups
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/opt/lxcer/lxcer -config /etc/lxcer/config.yml -a backup -concurrently
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+TimeoutStartSec=4h
