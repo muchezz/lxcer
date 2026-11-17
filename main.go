@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -22,14 +23,19 @@ var buildDate = "unknown"
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 func run(args []string, out, errOut io.Writer) int {
+	return runWithRunner(args, out, errOut, ExecRunner{})
+}
+func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
+	legacyFlags := len(args) > 0 && strings.HasPrefix(args[0], "-")
 	f := flag.NewFlagSet("lxcer", flag.ContinueOnError)
 	f.SetOutput(errOut)
 	sourceHost := f.String("source-host", "", "catalog source host filter")
 	legacy := f.Bool("legacy", false, "include pre-modernization repository snapshots in discovery")
 	legacyMetadata := f.String("legacy-metadata", "", "JSON instance metadata for adopting an old archive")
 	artifactPath := f.String("artifact-path", "", "original absolute archive path in a legacy snapshot")
-	action := f.String("a", "", "backup, list, discover, verify, restore-plan, restore, restore-test, cleanup, recover, capabilities, validate, retention, recover-catalog, version")
+	action := f.String("a", "", "backup, list, discover, verify, restore-plan, restore, restore-test, cleanup, recover, capabilities, validate, retention, recover-catalog, adopt-legacy, version")
 	config := f.String("config", "conf.yml", "YAML configuration")
+	stopped := f.Bool("stopped", false, "keep a legacy restore stopped instead of starting it")
 	local := f.Bool("local", false, "use local LXD")
 	host := f.String("remote-host", "", "authenticated LXD remote")
 	name := f.String("container", "", "select exactly one instance")
@@ -49,8 +55,12 @@ func run(args []string, out, errOut io.Writer) int {
 	target := f.String("target", "", "new catalog recovery directory")
 	restoreVolumes := f.Bool("restore-volumes", false, "restore exported managed volumes under new names")
 	nativeTarget := f.String("native-target", "", "new filesystem restore directory")
-	level := f.String("log-level", "info", "debug, info, warn, error")
-	jsonLog := f.Bool("json-log", true, "structured JSON logging")
+	defaultLevel := "info"
+	if legacyFlags {
+		defaultLevel = "error"
+	}
+	level := f.String("log-level", defaultLevel, "debug, info, warn, error")
+	jsonLog := f.Bool("json-log", !legacyFlags, "structured JSON logging")
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		args = append([]string{"-a", args[0]}, args[1:]...)
 	}
@@ -119,7 +129,7 @@ func run(args []string, out, errOut io.Writer) int {
 		}
 		hosts = []Host{h}
 	}
-	e := Engine{C: c, R: ExecRunner{}, Log: log}
+	e := Engine{C: c, R: runner, Log: log}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	ctx, stop := context.WithTimeout(ctx, c.Timeout)
@@ -235,7 +245,21 @@ func run(args []string, out, errOut io.Writer) int {
 				break
 			}
 		}
-		o := RestoreOptions{RestoreVolumes: *restoreVolumes, Name: *as, Host: selectedHost, Destination: *dest, Snapshot: *snapshot, Pool: *pool, Networks: ns, DryRun: *action == "restore-plan", Test: *action == "restore-test", Isolated: *isolated, Profile: *profile, Health: argv, NativeTarget: *nativeTarget}
+		restoreDestination := *dest
+		if restoreDestination == "" && c.RestoreResticRepo.Path != "" {
+			restoreDestination = "legacy-restore"
+			for i, d := range c.Destinations {
+				if d.Path == c.RestoreResticRepo.Path {
+					restoreDestination = d.Name
+					override := c.RestoreResticRepo
+					override.Name = d.Name
+					e.C.Destinations[i] = override
+					break
+				}
+			}
+		}
+		legacyRestore := legacyFlags && c.Legacy
+		o := RestoreOptions{Start: legacyRestore && !*stopped, RestoreVolumes: *restoreVolumes, Name: *as, Host: selectedHost, Destination: restoreDestination, Snapshot: *snapshot, Pool: *pool, Networks: ns, DryRun: *action == "restore-plan", Test: *action == "restore-test", Isolated: *isolated, Profile: *profile, Health: argv, NativeTarget: *nativeTarget}
 
 		pairs := map[string]string{}
 		if *restoreList != "" {
@@ -254,32 +278,76 @@ func run(args []string, out, errOut io.Writer) int {
 			}
 			pairs[source] = *as
 		}
+
 		var restoreErrors []error
-		for source, to := range pairs {
+		var restoreMu sync.Mutex
+		var restoreWG sync.WaitGroup
+		slots := make(chan struct{}, c.Workers)
+		restoreSingle := func(source, to string) error {
 			jobPath := *manifest
 			job := m
 			if jobPath == "" {
-				job, jobPath, err = e.findManifest(source, *sourceHost)
-				if err != nil {
-					restoreErrors = append(restoreErrors, err)
-					continue
+				var lookupErr error
+				job, jobPath, lookupErr = e.findManifest(source, *sourceHost)
+				if lookupErr != nil {
+					if legacyRestore && *action == "restore" && *sourceHost == "" && errors.Is(lookupErr, errNoCatalog) {
+						if *pool != "" || *networks != "" || *restoreVolumes {
+							return errors.New("legacy archive mappings require explicit metadata adoption")
+						}
+						if er := e.restoreLegacy(ctx, source, to, selectedHost, restoreDestination, *snapshot, !*stopped); er != nil {
+							return er
+						}
+						restoreMu.Lock()
+						fmt.Fprintf(out, "legacy restore: %s -> %s:%s\n", source, selectedHost, to)
+						restoreMu.Unlock()
+						return nil
+					}
+					return lookupErr
 				}
 			}
 			if source != job.Instance.Name {
-				restoreErrors = append(restoreErrors, errors.New("restore source does not match manifest"))
-				continue
+				return errors.New("restore source does not match manifest")
 			}
-			o.Name = to
-			er := e.restore(ctx, &job, o)
+			options := o
+			options.Name = to
+			er := e.restore(ctx, &job, options)
 			if *action == "restore-test" && job.RestoreTest != nil {
 				er = errors.Join(er, job.save(filepath.Dir(jobPath)))
 			}
 			if er != nil {
-				restoreErrors = append(restoreErrors, er)
-			} else {
-				fmt.Fprintf(out, "%s: %s -> %s:%s (stopped unless isolated health test)\n", *action, source, selectedHost, to)
+				return er
 			}
+			state := "stopped"
+			if options.Start {
+				state = "started"
+			}
+			restoreMu.Lock()
+			fmt.Fprintf(out, "%s: %s -> %s:%s (%s)\n", *action, source, selectedHost, to, state)
+			restoreMu.Unlock()
+			return nil
 		}
+		for source, to := range pairs {
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				restoreMu.Lock()
+				restoreErrors = append(restoreErrors, ctx.Err())
+				restoreMu.Unlock()
+				continue
+			}
+			restoreWG.Add(1)
+			go func(source, to string) {
+				defer restoreWG.Done()
+				defer func() { <-slots }()
+				if er := restoreSingle(source, to); er != nil {
+					restoreMu.Lock()
+					restoreErrors = append(restoreErrors, er)
+					restoreMu.Unlock()
+				}
+			}(source, to)
+		}
+		restoreWG.Wait()
+
 		err = errors.Join(restoreErrors...)
 		if *action == "restore-test" {
 			err = errors.Join(err, e.writeMetrics())

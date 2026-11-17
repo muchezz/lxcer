@@ -9,6 +9,7 @@ import (
 )
 
 type Container struct {
+	ExpandedConfig  map[string]string            `json:"expanded_config"`
 	Name            string                       `json:"name"`
 	StatusCode      int                          `json:"status_code"`
 	Type            string                       `json:"type"`
@@ -217,4 +218,15 @@ func chooseStrategy(p Policy, cap Capabilities, c Container) (string, error) {
 		return "", errors.New("unknown strategy")
 	}
 	return s, nil
+}
+
+func effectiveConfig(c Container) map[string]string {
+	cfg := map[string]string{}
+	for k, v := range c.ExpandedConfig {
+		cfg[k] = v
+	}
+	for k, v := range c.Config {
+		cfg[k] = v
+	}
+	return cfg
 }

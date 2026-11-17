@@ -40,7 +40,13 @@ func (e Engine) hooks(ctx context.Context, l LXD, c Container, hs []Hook) error 
 	return errors.Join(errs...)
 }
 func (e Engine) Backup(ctx context.Context, hosts []Host, name string) error {
-	if len(e.C.Destinations) == 0 {
+	needsDestinations := false
+	for _, host := range hosts {
+		if host.SSH == "" {
+			needsDestinations = true
+		}
+	}
+	if needsDestinations && len(e.C.Destinations) == 0 {
 		return errors.New("no backup destinations configured")
 	}
 	required := false
@@ -49,7 +55,7 @@ func (e Engine) Backup(ctx context.Context, hosts []Host, name string) error {
 			required = true
 		}
 	}
-	if !required {
+	if needsDestinations && !required {
 		return errors.New("at least one required destination is needed for safe cleanup")
 	}
 	if err := privateDir(e.C.StateDir); err != nil {
@@ -191,10 +197,10 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 	if err = e.writeMetrics(); err != nil {
 		return err
 	}
-	if strings.Contains(c.Config["raw.lxc"], "mount") && !p.AllowExcluded {
+	if strings.Contains(effectiveConfig(c)["raw.lxc"], "mount") && !p.AllowExcluded {
 		return errors.New("raw.lxc mount configuration needs an explicit external-data policy")
 	}
-	if c.Config["raw.lxc"] != "" {
+	if effectiveConfig(c)["raw.lxc"] != "" {
 		log.Warn("raw LXC configuration requires independent dependency review")
 	}
 	if err = freeSpace(dir, e.C.MinFreeBytes); err != nil {
@@ -356,13 +362,20 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 		if er = m.save(dir); er != nil {
 			return er
 		}
-		if _, err = l.run(ctx, "image", "export", l.ref(id), filepath.Join(dir, "image")); err != nil {
+		if _, err = l.run(ctx, "image", "export", l.ref(id), filepath.Join(dir, c.Name)); err != nil {
 			return err
 		}
-		files, er := filepath.Glob(filepath.Join(dir, "image*"))
+		files, er := filepath.Glob(filepath.Join(dir, c.Name+"*"))
 		if er != nil {
 			return er
 		}
+		filtered := files[:0]
+		for _, file := range files {
+			if filepath.Base(file) != "manifest.json" {
+				filtered = append(filtered, file)
+			}
+		}
+		files = filtered
 		if len(files) != 1 {
 			return errors.New("expected one unified container image; split images require full strategy")
 		}

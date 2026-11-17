@@ -28,11 +28,7 @@ inventory:
   - name: legacy-agent
     ssh: legacy-agent
     remote_config: /etc/lxcer/legacy-agent.yml
-# Controller validates destinations; source agent has independent real credentials.
-destinations:
-  - name: controller-policy
-    path: /srv/restic/controller
-    password_env: LXCER_CONTROLLER_PASSWORD
+# All jobs use source-side agents; repository credentials live only on agents.
 ```
 
 Configure the SSH alias with a dedicated identity and pinned host key. Install the same reviewed binary on the source agent. On that source, `/etc/lxcer/legacy-agent.yml`:

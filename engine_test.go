@@ -90,9 +90,16 @@ func (f *fakeRunner) Run(ctx context.Context, env []string, in []byte, cmd strin
 			id := a[len(a)-1]
 			paths, ok := f.repos[repo][id]
 			if !ok {
+				if id == "--json" {
+					var rows []any
+					for snap, paths := range f.repos[repo] {
+						rows = append(rows, map[string]any{"id": snap, "paths": paths, "time": time.Unix(1600000000, 0).UTC()})
+					}
+					return jsonBytes(rows)
+				}
 				return []byte("[]"), nil
 			}
-			return jsonBytes([]any{map[string]any{"id": id, "paths": paths}})
+			return jsonBytes([]any{map[string]any{"id": id, "paths": paths, "time": time.Unix(1600000000, 0).UTC()}})
 		case "ls":
 			return jsonBytes(map[string]string{"struct_type": "node", "path": a[len(a)-1]})
 		case "restore":
@@ -239,7 +246,14 @@ func (f *fakeRunner) Run(ctx context.Context, env []string, in []byte, cmd strin
 		return nil, nil
 	case "init":
 		host, n := splitRef(a[2])
-		f.instances[host] = append(f.instances[host], instance(n, 102))
+		c := instance(n, 102)
+		for i, v := range a {
+			if v == "-c" {
+				k, value, _ := strings.Cut(a[i+1], "=")
+				c.Config[k] = value
+			}
+		}
+		f.instances[host] = append(f.instances[host], c)
 		return nil, nil
 	case "config":
 		if a[1] == "set" {

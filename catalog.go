@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+var errNoCatalog = errors.New("no verified catalog entry for requested source")
+
 func (e Engine) findManifest(name, host string) (Manifest, string, error) {
 	files, err := filepath.Glob(filepath.Join(e.C.StateDir, "lxcer-*", "manifest.json"))
 	if err != nil {
@@ -34,7 +36,7 @@ func (e Engine) findManifest(name, host string) (Manifest, string, error) {
 		}
 	}
 	if selected == "" {
-		return found, "", errors.New("no verified catalog entry for requested source")
+		return found, "", errNoCatalog
 	}
 	return found, selected, nil
 }
@@ -64,6 +66,21 @@ func (e Engine) adoptLegacy(ctx context.Context, destination, id, artifact, meta
 	if err = r.verify(ctx, id, []string{artifact}); err != nil {
 		return m, err
 	}
+
+	snapshotJSON, err := r.run(ctx, "snapshots", "--json", id)
+	if err != nil {
+		return m, err
+	}
+	var metadataRows []struct {
+		Time time.Time `json:"time"`
+	}
+	if err = json.Unmarshal(snapshotJSON, &metadataRows); err != nil {
+		return m, err
+	}
+	if len(metadataRows) != 1 || metadataRows[0].Time.IsZero() {
+		return m, errors.New("legacy snapshot timestamp unavailable; cannot assign a reliable backup age")
+	}
+	capturedAt := metadataRows[0].Time
 	if err = privateDir(e.C.StateDir); err != nil {
 		return m, err
 	}
@@ -84,7 +101,7 @@ func (e Engine) adoptLegacy(ctx context.Context, destination, id, artifact, meta
 		return m, err
 	}
 	// The original archive path is retained for Restic lookup; no job-owned cleanup applies.
-	m = Manifest{Version: 1, ID: jobID, Host: host, Instance: c, Strategy: "snapshot", State: Verified, Started: time.Now().UTC(), Completed: time.Now().UTC(), Artifact: artifact, Paths: []string{artifact}, SHA256: sum, Size: size, Attachments: attachments(c), Destinations: []DestinationStatus{{Name: d.Name, Required: true, SnapshotID: id, Verified: true}}, Cleanup: "legacy artifact; no cleanup authorization", Legacy: true}
+	m = Manifest{Version: 1, ID: jobID, Host: host, Instance: c, Strategy: "snapshot", State: Verified, Started: capturedAt, Completed: capturedAt, Artifact: artifact, Paths: []string{artifact}, SHA256: sum, Size: size, Attachments: attachments(c), Destinations: []DestinationStatus{{Name: d.Name, Required: true, SnapshotID: id, Verified: true}}, Cleanup: "legacy artifact; no cleanup authorization", Legacy: true}
 	if err = m.save(dir); err != nil {
 		return m, err
 	}

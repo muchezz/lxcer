@@ -38,7 +38,7 @@ The old local selection skipped stopped containers and ignored `-container`; pip
 
 ### Review description: recovery
 
-Import only after restoring and checking the exact archive checksum. Refuse name collisions, keep normal restores stopped, map explicit storage/network devices and record test-owned resources. Recover local catalog metadata from tagged repository receipts and adopt older archives with explicit instance metadata. Validate collision, checksum, failed import/configuration/health, interrupted resume and filesystem round trips; application recovery still requires an audited health procedure.
+Import only after restoring and checking the exact archive checksum. Refuse name collisions, keep modern restores stopped while preserving original flag-based startup, map explicit storage/network devices and record test-owned resources. Recover local catalog metadata from tagged repository receipts and adopt older archives with explicit instance metadata. Validate collision, checksum, failed import/configuration/health, interrupted resume and filesystem round trips; application recovery still requires an audited health procedure.
 
 ### Review description: operations
 
@@ -46,4 +46,4 @@ Add bounded-label Prometheus textfile metrics, alert/dashboard examples, strict 
 
 ## Deliberate compatibility changes
 
-Failures and partial results now return nonzero. Stopped containers are included. Empty/missing selection is an error. Explicit selection never silently chooses other instances. External disks require capture or an acknowledged exclusion. Required destination verification and catalog receipts gate cleanup. Restores stay stopped; destructive overwrite is unavailable. `-cleanup` is rejected. Plaintext YAML passwords remain supported for migration but examples use protected sources. Old restore configurations must choose a named destination and old archives need explicit metadata adoption. Go/Restic minimums increased. Unknown YAML keys and malformed restore-list lines fail rather than being ignored.
+Failures and partial results now return nonzero. Stopped containers are included. Empty/missing selection is an error. Explicit selection never silently chooses other instances. External disks require capture or an acknowledged exclusion. Required destination verification and catalog receipts gate cleanup. Modern restore commands stay stopped; original flag-based restores with unversioned configuration still start unless `-stopped` is supplied. Destructive overwrite is unavailable. `-cleanup` is rejected. Plaintext YAML passwords remain supported for migration but examples use protected sources. Original restore configuration/repository selection and old archive restores remain usable without manual adoption. Explicit adoption is available for modern metadata/mapping workflows. Go/Restic minimums increased. Unknown YAML keys and malformed restore-list lines fail rather than being ignored.

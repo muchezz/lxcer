@@ -12,6 +12,7 @@ import (
 )
 
 type RestoreOptions struct {
+	Start          bool
 	RestoreVolumes bool
 	Name           string
 	Host           string
@@ -28,6 +29,11 @@ type RestoreOptions struct {
 }
 
 func (e Engine) destination(name string) (Destination, error) {
+	if name == "legacy-restore" && e.C.RestoreResticRepo.Path != "" {
+		d := e.C.RestoreResticRepo
+		d.Name = name
+		return d, nil
+	}
 	for _, d := range e.C.Destinations {
 		if d.Name == name {
 			return d, nil
@@ -295,7 +301,7 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 	}
 	// Construct configuration explicitly; do not inherit source host profiles or autostart.
 	cfg := map[string]string{}
-	for k, v := range m.Instance.Config {
+	for k, v := range effectiveConfig(m.Instance) {
 		if !strings.HasPrefix(k, "volatile.") && !strings.HasPrefix(k, "raw.") {
 			cfg[k] = v
 		}
@@ -378,6 +384,11 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 	}
 	if !found {
 		return errors.New("restored instance missing after import")
+	}
+	if opt.Start && !opt.Test {
+		if _, err = l.run(ctx, "start", l.ref(opt.Name)); err != nil {
+			return err
+		}
 	}
 	if opt.Test && len(opt.Health) > 0 {
 		if _, err = l.run(ctx, "start", l.ref(opt.Name)); err != nil {

@@ -1,5 +1,7 @@
 # Restore and disaster recovery
 
+Original `-a restore` invocations with an unversioned config still select `restore_restic_repo`, restore `<container>.tar.zst`, and start the instance as before. They now verify the selected repository snapshot/path, refuse collisions and retain failed staging. `-stopped` suppresses startup. Multi-entry `-restore-list` and bounded `-concurrently` operation remain available. No new manifest or adoption step is required for this original workflow.
+
 A repository upload is not a tested recovery. Periodically perform a disposable restore test, inspect filesystem content and run application-specific checks. Record measured backup age and restore duration against your RPO/RTO. Keep source configuration, network definitions, profile definitions, certificates and external storage recovery procedures in a separate administrative backup.
 
 ## Discover and plan
@@ -51,7 +53,7 @@ restic snapshots --json --tag lxcer-receipt
 
 The recovered manifest includes data snapshot IDs and original archive paths. Pass its actual recovered pathname to `-manifest`. Export-time sidecars in `lxcer-data` snapshots remain useful if receipt upload was interrupted. They lack final verification receipts; select and verify an exact data snapshot manually. Receipt snapshots are retained as catalog history even when scoped data retention expires an old archive; a historical receipt alone does not prove the data snapshot still exists.
 
-For old `.tar.zst` archives use `discover -legacy`, obtain a JSON instance object (for example a saved object from `lxc list --format json`), then adopt it:
+For modern commands that need explicit metadata, pool/network mapping or catalog integration with old `.tar.zst` archives, use `discover -legacy`, obtain a JSON instance object (for example a saved object from `lxc list --format json`), then adopt it:
 
 ```sh
 ./lxcer adopt-legacy -config conf.yml -destination primary -source-host old \

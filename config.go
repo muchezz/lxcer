@@ -58,6 +58,7 @@ type Destination struct {
 	KeepWeekly   int    `yaml:"keep_weekly"`
 }
 type Config struct {
+	Legacy            bool          `yaml:"-"`
 	Version           int           `yaml:"version"`
 	Hosts             []string      `yaml:"hosts"`
 	Inventory         []Host        `yaml:"inventory"`
@@ -88,6 +89,17 @@ func readConfig(path string) (Config, error) {
 	if e = d.Decode(&c); e != nil {
 		return c, e
 	}
+	var fields map[string]yaml.Node
+	if e = yaml.Unmarshal(b, &fields); e != nil {
+		return c, e
+	}
+	_, versioned := fields["version"]
+	c.Legacy = !versioned
+	if c.Legacy {
+		if _, set := fields["compression"]; !set {
+			c.Compression = "zstd"
+		}
+	}
 	if len(c.Destinations) == 0 {
 		c.Destinations = c.BackupResticRepos
 	}
@@ -102,6 +114,11 @@ func readConfig(path string) (Config, error) {
 			c.Destinations[i].PasswordFile = v
 			c.Destinations[i].Password = ""
 		}
+		if c.RestoreResticRepo.Path != "" {
+			c.RestoreResticRepo.PasswordFile = v
+			c.RestoreResticRepo.Password = ""
+			c.RestoreResticRepo.PasswordEnv = ""
+		}
 	}
 	for i := range c.Destinations {
 		if c.Destinations[i].Name == "" {
@@ -115,6 +132,9 @@ func readConfig(path string) (Config, error) {
 	}
 	if c.Policy.Strategy == "" {
 		c.Policy.Strategy = "auto"
+		if c.Legacy {
+			c.Policy.Strategy = "snapshot"
+		}
 	}
 	c.StateDir, e = filepath.Abs(c.StateDir)
 	if e != nil {
@@ -186,7 +206,13 @@ func (c Config) Validate() error {
 		}
 	}
 	names = map[string]bool{}
-	for _, d := range c.Destinations {
+	validationDestinations := append([]Destination{}, c.Destinations...)
+	if c.RestoreResticRepo.Path != "" {
+		d := c.RestoreResticRepo
+		d.Name = "legacy-restore"
+		validationDestinations = append(validationDestinations, d)
+	}
+	for _, d := range validationDestinations {
 		if !validName(d.Name) || names[d.Name] || d.Path == "" || d.KeepLast < 0 || d.KeepDaily < 0 || d.KeepWeekly < 0 {
 			return errors.New("invalid or duplicate destination")
 		}

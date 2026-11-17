@@ -123,12 +123,17 @@ func privateDir(path string) error {
 	}
 	return nil
 }
-func atomicWrite(path string, b []byte) error {
+func atomicWrite(path string, b []byte) error { return atomicWriteMode(path, b, 0600) }
+func atomicWriteMode(path string, b []byte, mode os.FileMode) error {
 	f, e := os.CreateTemp(filepath.Dir(path), ".write-")
 	if e != nil {
 		return e
 	}
 	defer os.Remove(f.Name())
+	if e = f.Chmod(mode); e != nil {
+		f.Close()
+		return e
+	}
 	if _, e = f.Write(b); e != nil {
 		f.Close()
 		return e

@@ -209,6 +209,10 @@ func TestMetricsDurable(t *testing.T) {
 	if er := e.Backup(context.Background(), []Host{{Name: "local"}}, "stopped"); er != nil {
 		t.Fatal(er)
 	}
+
+	if info, er := os.Stat(e.C.MetricsFile); er != nil || info.Mode().Perm() != 0644 {
+		t.Fatal("metrics file must be readable by node_exporter")
+	}
 	b, er := os.ReadFile(e.C.MetricsFile)
 	if er != nil {
 		t.Fatal(er)
@@ -243,6 +247,7 @@ func TestIncrementalMirrorRefreshAndCollision(t *testing.T) {
 func TestSSHAgentCommandQuotingAndFailure(t *testing.T) {
 	f := fake()
 	e := testEngine(t, f)
+	e.C.Destinations = nil
 	path := "/etc/lxcer/a'$(touch nope).yml"
 	if er := e.Backup(context.Background(), []Host{{Name: "source", SSH: "source-agent", RemoteConfig: path}}, "stopped"); er == nil {
 		t.Fatal("failed agent reported success")

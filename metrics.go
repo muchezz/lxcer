@@ -101,5 +101,5 @@ func (e Engine) writeMetrics() error {
 	if _, err = os.Stat(filepath.Dir(e.C.MetricsFile)); err != nil {
 		return err
 	}
-	return atomicWrite(e.C.MetricsFile, []byte(b.String()))
+	return atomicWriteMode(e.C.MetricsFile, []byte(b.String()), 0644)
 }

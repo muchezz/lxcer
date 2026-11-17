@@ -68,6 +68,7 @@ func TestRestorePlanDoesNotMutate(t *testing.T) {
 }
 func TestSuccessfulRestoreStoppedAndConfig(t *testing.T) {
 	e, f, m := backedUp(t)
+	m.Instance.ExpandedConfig = map[string]string{"limits.cpu": "3", "boot.autostart": "true"}
 	m.Instance.Config["boot.autostart"] = "true"
 	m.Instance.ExpandedDevices["net"] = map[string]string{"type": "nic", "network": "prod"}
 	o := RestoreOptions{Name: "restored", Host: "lab", Destination: "primary", Networks: map[string]string{"prod": "dr"}, Pool: "other"}
@@ -75,6 +76,9 @@ func TestSuccessfulRestoreStoppedAndConfig(t *testing.T) {
 		t.Fatal(er)
 	}
 	c := f.instances["lab"][0]
+	if c.Config["limits.cpu"] != "3" {
+		t.Fatal("inherited profile configuration lost")
+	}
 	if c.StatusCode != 102 || c.Config["boot.autostart"] != "false" || c.ExpandedDevices["net"]["network"] != "dr" || c.ExpandedDevices["root"]["pool"] != "other" {
 		t.Fatalf("incorrect restored config %+v", c)
 	}
@@ -139,6 +143,9 @@ func TestLegacyAdoption(t *testing.T) {
 	m, er := e.adoptLegacy(context.Background(), "primary", id, archive, metadata, "old")
 	if er != nil {
 		t.Fatal(er)
+	}
+	if m.Started.Unix() != 1600000000 {
+		t.Fatal("adoption reset original backup age")
 	}
 	if !m.Legacy || m.SHA256 == "" {
 		t.Fatal("bad adoption")
