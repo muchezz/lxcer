@@ -314,7 +314,6 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 		}
 		if opt.Test {
 			if d["type"] != "disk" || d["path"] != "/" {
-				devices[n] = map[string]string{"type": "none"}
 				continue
 			}
 		}
@@ -338,7 +337,7 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 	}
 	profiles := []string{}
 	if opt.Test {
-		profiles = []string{opt.Profile}
+		profiles = []string{}
 		for k := range cfg {
 			if strings.HasPrefix(k, "security.") {
 				delete(cfg, k)
@@ -437,6 +436,10 @@ func (e Engine) recoverJobs(ctx context.Context, execute bool) error {
 				return er
 			}
 			fmt.Printf("%s interrupted; resources retained\n", m.ID)
+		}
+
+		if m.State == Failed || m.State == PartiallyCompleted {
+			fmt.Printf("%s retained state=%s snapshot=%s image=%s artifact=%s\n", m.ID, m.State, m.Snapshot, m.ImageFingerprint, m.Artifact)
 		}
 		if m.State == Verified {
 			fmt.Printf("%s eligible for cleanup\n", m.ID)

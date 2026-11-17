@@ -52,31 +52,32 @@ type VolumeArtifact struct {
 	Size     int64  `json:"size_bytes"`
 }
 type Manifest struct {
-	Legacy       bool                `json:"legacy,omitempty"`
-	Volumes      []VolumeArtifact    `json:"volumes,omitempty"`
-	NeedsResume  bool                `json:"needs_resume"`
-	ResumeHooks  []Hook              `json:"resume_hooks,omitempty"`
-	Version      int                 `json:"version"`
-	ID           string              `json:"id"`
-	Host         string              `json:"host"`
-	Instance     Container           `json:"instance"`
-	Capabilities Capabilities        `json:"capabilities"`
-	Storage      string              `json:"storage"`
-	Strategy     string              `json:"strategy"`
-	State        State               `json:"state"`
-	Started      time.Time           `json:"started"`
-	Completed    time.Time           `json:"completed,omitempty"`
-	Size         int64               `json:"size_bytes"`
-	SHA256       string              `json:"sha256,omitempty"`
-	Artifact     string              `json:"artifact,omitempty"`
-	Paths        []string            `json:"paths,omitempty"`
-	Attachments  []Attachment        `json:"attachments"`
-	Destinations []DestinationStatus `json:"destinations"`
-	Error        string              `json:"error,omitempty"`
-	Cleanup      string              `json:"cleanup"`
-	Snapshot     string              `json:"snapshot,omitempty"`
-	ImageAlias   string              `json:"image_alias,omitempty"`
-	RestoreTest  *RestoreTest        `json:"restore_test,omitempty"`
+	ImageFingerprint string              `json:"image_fingerprint,omitempty"`
+	Legacy           bool                `json:"legacy,omitempty"`
+	Volumes          []VolumeArtifact    `json:"volumes,omitempty"`
+	NeedsResume      bool                `json:"needs_resume"`
+	ResumeHooks      []Hook              `json:"resume_hooks,omitempty"`
+	Version          int                 `json:"version"`
+	ID               string              `json:"id"`
+	Host             string              `json:"host"`
+	Instance         Container           `json:"instance"`
+	Capabilities     Capabilities        `json:"capabilities"`
+	Storage          string              `json:"storage"`
+	Strategy         string              `json:"strategy"`
+	State            State               `json:"state"`
+	Started          time.Time           `json:"started"`
+	Completed        time.Time           `json:"completed,omitempty"`
+	Size             int64               `json:"size_bytes"`
+	SHA256           string              `json:"sha256,omitempty"`
+	Artifact         string              `json:"artifact,omitempty"`
+	Paths            []string            `json:"paths,omitempty"`
+	Attachments      []Attachment        `json:"attachments"`
+	Destinations     []DestinationStatus `json:"destinations"`
+	Error            string              `json:"error,omitempty"`
+	Cleanup          string              `json:"cleanup"`
+	Snapshot         string              `json:"snapshot,omitempty"`
+	ImageAlias       string              `json:"image_alias,omitempty"`
+	RestoreTest      *RestoreTest        `json:"restore_test,omitempty"`
 }
 
 func newID() string {

@@ -45,7 +45,7 @@ func splitRef(s string) (string, string) {
 }
 func jsonBytes(v any) ([]byte, error) { return json.Marshal(v) }
 func (f *fakeRunner) Run(ctx context.Context, env []string, in []byte, cmd string, a ...string) ([]byte, error) {
-	if cmd == "restic" && f.realRestic {
+	if (cmd == "restic" || cmd == "zstd") && f.realRestic {
 		return (ExecRunner{}).Run(ctx, env, in, cmd, a...)
 	}
 	f.mu.Lock()
@@ -143,6 +143,8 @@ func (f *fakeRunner) Run(ctx context.Context, env []string, in []byte, cmd strin
 		switch {
 		case path == "/1.0":
 			return []byte(`{"environment":{"server_version":"6.0"},"api_extensions":["container_backup","instances","container_incremental_copy","backup_override_name","container_backup_override_pool","custom_volume_backup"]}`), nil
+		case strings.HasPrefix(path, "/1.0/images/aliases/"):
+			return []byte(`{"target":"` + strings.Repeat("f", 64) + `"}`), nil
 		case strings.HasPrefix(path, "/1.0/storage-pools/"):
 			return []byte(`{"driver":"dir"}`), nil
 		case strings.HasPrefix(path, "/1.0/profiles/"):
@@ -488,6 +490,12 @@ func TestRealResticBackupVerifyRestore(t *testing.T) {
 			f.realRestic = true
 			e := testEngine(t, f)
 			e.C.Policy.Strategy = strategy
+			if strategy == "full" {
+				if _, er := exec.LookPath("zstd"); er != nil {
+					t.Skip("zstd unavailable")
+				}
+				e.C.Compression = "zstd"
+			}
 			e.C.Destinations[0].Path = filepath.Join(t.TempDir(), "repository")
 			e.C.Destinations[0].Password = "isolated-test-password"
 			e.C.Destinations[0].ReadData = true

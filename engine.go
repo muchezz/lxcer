@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -336,6 +337,24 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 		}
 		if _, err = l.run(ctx, "publish", l.ref(c.Name+"/"+id), "--alias", id, "--compression", "none"); err != nil {
 			return err
+		}
+
+		aliasInfo, er := l.run(ctx, "query", l.ref("/1.0/images/aliases/"+id))
+		if er != nil {
+			return er
+		}
+		var image struct {
+			Target string `json:"target"`
+		}
+		if er = json.Unmarshal(aliasInfo, &image); er != nil {
+			return er
+		}
+		if !snapshotID(image.Target) {
+			return errors.New("image publication returned no fingerprint")
+		}
+		m.ImageFingerprint = image.Target
+		if er = m.save(dir); er != nil {
+			return er
 		}
 		if _, err = l.run(ctx, "image", "export", l.ref(id), filepath.Join(dir, "image")); err != nil {
 			return err
