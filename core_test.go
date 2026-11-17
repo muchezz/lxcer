@@ -310,7 +310,7 @@ func TestConfigOverridesAndPolicyPrecedence(t *testing.T) {
 		t.Fatal(p)
 	}
 	path := filepath.Join(t.TempDir(), "conf.yml")
-	if er := os.WriteFile(path, []byte("destinations:\n - name: one\n   path: /tmp/repo\n   password: legacy\n"), 0600); er != nil {
+	if er := os.WriteFile(path, []byte("destinations:\n - name: one\n   path: /tmp/repo\n   password_env: IGNORED_PASSWORD_ENV\n"), 0600); er != nil {
 		t.Fatal(er)
 	}
 	secret := filepath.Join(t.TempDir(), "secret")

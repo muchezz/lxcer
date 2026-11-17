@@ -113,6 +113,7 @@ func readConfig(path string) (Config, error) {
 		for i := range c.Destinations {
 			c.Destinations[i].PasswordFile = v
 			c.Destinations[i].Password = ""
+			c.Destinations[i].PasswordEnv = ""
 		}
 		if c.RestoreResticRepo.Path != "" {
 			c.RestoreResticRepo.PasswordFile = v
