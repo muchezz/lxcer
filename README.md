@@ -1,63 +1,52 @@
 # lxcer
-Backup/restore tool for `LXC` containers to `restic` with `zstd` compression.
 
-### Requirements
+Backup, verify and restore LXD containers using LXC and Restic. Originally written by [pavel1337](https://github.com/pavel1337/lxcer); modernization developed in [muchezz/lxcer](https://github.com/muchezz/lxcer). The original Git history and module name are preserved.
 
-- zstd >= 1.38
-- lxc >= 3.0.3
-- restic >= 0.10.0
+The modernization replaces the original duplicated pipelines with locked, durable jobs. Running and stopped containers are selected consistently; failed required uploads produce a nonzero exit and retain recovery artifacts. Required Restic snapshots and tree paths are verified before cleanup. Restore creates stopped instances and refuses collisions.
 
-### Description
-This is wrapper for `lxc`, `zstd`, `restic` CLI interfaces. Before running:
-- all listed above programs are installed and in the $PATH
-- configure the `conf.yml` accordingly
-- all hosts that are listed in `conf.yml` are indeed available for lxc cli: `lxc remote list`
-- all restic repos that are listed in `conf.yml` are created and not broken
+**Compatibility status:** automated command simulations cover LXD 3.0.3, 4.0, 5.0, 5.21, 6.0 and capability-based future behavior. No real LXD server/storage combination has yet been verified in this development environment. Real local Restic 0.16.4 and zstd 1.5.5 are exercised in isolated tests. Read [compatibility](docs/COMPATIBILITY.md) before adoption. This branch needs disposable-host qualification before production rollout.
 
-It does simple `restic check` before any work starts and fatals out in case an error.
+## Build and install
 
-#### Backup
-Follows logic below:
-1. Create (remote) snapshot
-2. Publish (remote) snapshot as image
-3. Export image as .tar
-4. Compress .tar to .tar.zst
-5. Push .tar.zst to listed restic repos.
+Linux, Go 1.26 or later, authenticated `lxc`, Restic 0.16 or later, and optionally zstd 1.5 or later. Earlier Restic releases used by the original tool require upgrading for verified restores. No privileged daemon is installed.
 
-If run concurrently, then for each remote host starts its own goroutine which creates and publishes snapshots. Then passes image to next goroutine which exports it, then passes to next one which compresses it and passes it further to goroutines that push compressed archives to restic repos.
-
-##### Examples
-1. Backup all containers from all hosts listed in `/etc/lxc/config.yml` concurrently with only errors as output (if any)
-
-`lxcer -a backup --config /etc/lxcer/config.yml --concurrently`
-
-2. Backup all containers from host ```host-01``` concurrently with only errors as output (if any)
-
-`lxcer -a backup --remote-host host-01 --config /etc/lxcer/config.yml --concurrently`
-
-3. Backup container ```container-01``` from host ```host-01``` concurrently with only errors as output (if any)
-
-`lxcer -a backup --remote-host host-01 --container contrainer-01 --config /etc/lxcer/config.yml --concurrently`
-
-#### Restore
-Follows logic below:
-1. Download latest snapshot for container
-2. Decompress it from .tar.zst to .tar
-3. Import .tar as (remote) image
-4. Start (remote) container from (remote) image.
-
-##### Examples
-Restore single container with name `app-01` as container `app-02` on remote host with name `rhost-01` with log info printed in terminal.
-
-`lxcer -config conf.yml -a restore -container app-01 --as app-02 -remote-host rhost-01 --log-level info`
-
-Restore a list of containers on remote host `rhost-01` with log info printed in terminal.
-
-`lxcer -config conf.yml -a restore -restore-list restore.lst -remote-host rhost-01 -concurrently`
-
-The restore.lst should be in the format below:
-
+```sh
+go test ./...
+go build -trimpath -o ./lxcer .
+./lxcer version
+./lxcer validate -config conf.yml
 ```
-container_to_restore:name_of_restored_container
+
+Build and test the local binary before installing a separately versioned copy under `/opt/lxcer`. This work does not replace `/usr/local/bin/lxcer`. Initialize repositories separately with Restic; lxcer never initializes or prunes production repositories automatically.
+
+## Usage
+
+```sh
+# Credentials come from an environment variable, or a protected password_file.
+export LXCER_RESTIC_PASSWORD='your-repository-password'
+./lxcer backup -config conf.yml -local -container stopped-staging
+./lxcer backup -config conf.yml -concurrently
+./lxcer capabilities -config conf.yml -remote-host legacy
+./lxcer list -config conf.yml
+./lxcer discover -config conf.yml -destination primary
+./lxcer verify -config conf.yml -manifest /private/state/lxcer-ID/manifest.json
+./lxcer restore-plan -config conf.yml -container app -as app-dr -remote-host lab -destination primary
+./lxcer restore -config conf.yml -container app -as app-dr -remote-host lab -destination primary
+./lxcer cleanup -config conf.yml                  # preview only
+./lxcer recover -config conf.yml -execute         # resume interrupted hooks, retain failed artifacts
 ```
-So the command above will restore the container `container_to_restore` as `name_of_restored_container` on remote host `rhost-01`
+
+`-a backup`, `-config`, `-local`, `-container`, `-remote-host`, `-concurrently`, `-restore-list` and `-as` remain available. `-cleanup` is rejected because its original implementation deleted unrelated resources. All command failures return 1; malformed CLI arguments return 2. Partial success returns 1 with `PartiallyCompleted` in the manifest.
+
+## Operations documentation
+
+- [Architecture and baseline audit](docs/ARCHITECTURE.md), [baseline](docs/BASELINE.md)
+- [Configuration, migration, strategies and multi-host operation](docs/CONFIGURATION.md)
+- [LXD and storage compatibility](docs/COMPATIBILITY.md)
+- [Restoration and disaster recovery](docs/RESTORE.md)
+- [Application consistency and legacy GitLab example](docs/APPLICATIONS.md)
+- [Security, monitoring, troubleshooting and performance](docs/OPERATIONS.md)
+- [Testing, releases and upstream contribution](docs/DEVELOPMENT.md)
+- [Validation report](docs/VALIDATION.md)
+
+No license file was present in the original repository. Preserve attribution; obtain the author's explicit license terms before redistributing releases. Local development is unaffected.
