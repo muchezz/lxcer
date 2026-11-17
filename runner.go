@@ -44,3 +44,22 @@ func (ExecRunner) Run(ctx context.Context, env []string, in []byte, cmd string, 
 	}
 	return out.Bytes(), nil
 }
+
+// StreamingRunner keeps filesystem streams out of the bounded command-output buffer.
+type StreamingRunner interface {
+	RunStream(context.Context, []string, io.Reader, io.Writer, string, ...string) error
+}
+
+func (ExecRunner) RunStream(ctx context.Context, env []string, in io.Reader, out io.Writer, cmd string, args ...string) error {
+	c := exec.CommandContext(ctx, cmd, args...)
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
+	c.Env = append(os.Environ(), env...)
+	c.Stdin = in
+	c.Stdout = out
+	c.Stderr = io.Discard
+	if err := c.Run(); err != nil {
+		return fmt.Errorf("%s stream operation failed: %w (output suppressed)", cmd, err)
+	}
+	return nil
+}

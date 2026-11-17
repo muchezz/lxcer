@@ -64,6 +64,10 @@ func (r Repository) run(ctx context.Context, args ...string) ([]byte, error) {
 	return nil, fmt.Errorf("destination %s: operation %s failed", r.D.Name, args[0])
 }
 func (r Repository) backup(ctx context.Context, paths []string, tags []string) (string, error) {
+	id, _, err := r.backupMeasured(ctx, paths, tags)
+	return id, err
+}
+func (r Repository) backupMeasured(ctx context.Context, paths []string, tags []string) (string, int64, error) {
 	args := []string{"backup", "--json"}
 	for _, tag := range tags {
 		args = append(args, "--tag", tag)
@@ -75,30 +79,33 @@ func (r Repository) backup(ctx context.Context, paths []string, tags []string) (
 	args = append(args, paths...)
 	b, e := r.run(ctx, args...)
 	if e != nil {
-		return "", e
+		return "", 0, e
 	}
 	s := bufio.NewScanner(bytes.NewReader(b))
 	s.Buffer(make([]byte, 4096), 1<<20)
 	id := ""
+	var uploaded int64
 	for s.Scan() {
 		var row struct {
-			Type string `json:"message_type"`
-			ID   string `json:"snapshot_id"`
+			Type  string `json:"message_type"`
+			ID    string `json:"snapshot_id"`
+			Bytes int64  `json:"data_added_packed"`
 		}
 		if e = json.Unmarshal(s.Bytes(), &row); e != nil {
-			return "", e
+			return "", 0, e
 		}
 		if row.Type == "summary" {
 			id = row.ID
+			uploaded = row.Bytes
 		}
 	}
 	if e = s.Err(); e != nil {
-		return "", e
+		return "", 0, e
 	}
 	if !snapshotID(id) {
-		return "", errors.New("restic returned no valid snapshot ID")
+		return "", 0, errors.New("restic returned no valid snapshot ID")
 	}
-	return id, nil
+	return id, uploaded, nil
 }
 func snapshotID(id string) bool {
 	if len(id) < 8 || len(id) > 64 {
@@ -139,27 +146,11 @@ func (r Repository) verify(ctx context.Context, id string, paths []string) error
 		if !found {
 			return fmt.Errorf("snapshot missing expected path %s", p)
 		}
-		b, e = r.run(ctx, "ls", "--json", id, p)
-		if e != nil {
+
+		if e = r.verifyNode(ctx, id, p); e != nil {
 			return e
 		}
-		s := bufio.NewScanner(bytes.NewReader(b))
-		found = false
-		for s.Scan() {
-			var row struct {
-				Type string `json:"struct_type"`
-				Path string `json:"path"`
-			}
-			if json.Unmarshal(s.Bytes(), &row) == nil && row.Type == "node" && row.Path == p {
-				found = true
-			}
-		}
-		if e = s.Err(); e != nil {
-			return e
-		}
-		if !found {
-			return errors.New("snapshot tree does not contain expected path")
-		}
+
 	}
 	if r.D.Check || r.D.ReadData {
 		args := []string{"check"}
@@ -173,6 +164,18 @@ func (r Repository) verify(ctx context.Context, id string, paths []string) error
 func (r Repository) retention(ctx context.Context, host, instance string, dry bool) error {
 	if r.D.KeepLast == 0 && r.D.KeepDaily == 0 && r.D.KeepWeekly == 0 {
 		return errors.New("retention not configured")
+	}
+	// The low-level legacy helper is retained for callers without chain data.
+	b, err := r.run(ctx, "snapshots", "--json", "--tag", "lxcer-chain,host="+host+",instance="+instance)
+	if err != nil {
+		return err
+	}
+	var chains []json.RawMessage
+	if err = json.Unmarshal(b, &chains); err != nil {
+		return err
+	}
+	if len(chains) > 0 {
+		return errors.New("chain data requires chain-aware retention")
 	}
 	a := []string{"forget", "--tag", "lxcer-data,host=" + host + ",instance=" + instance, "--group-by", ""}
 	for _, v := range []struct {

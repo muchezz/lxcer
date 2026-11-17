@@ -28,15 +28,20 @@ type Hooks struct {
 	Post    []Hook `yaml:"post"`
 }
 type Policy struct {
-	BackupVolumes bool     `yaml:"backup_volumes"`
-	NativeRoot    string   `yaml:"native_root"`
-	Strategy      string   `yaml:"strategy"`
-	Hooks         Hooks    `yaml:"hooks"`
-	Paths         []string `yaml:"paths"`
-	AllowExcluded bool     `yaml:"allow_excluded"`
-	Mirror        string   `yaml:"mirror"`
+	StorageSource       string   `yaml:"storage_source"`
+	SnapshotDir         string   `yaml:"snapshot_dir"`
+	MaxChain            int      `yaml:"max_chain"`
+	IncrementalFallback string   `yaml:"incremental_fallback"`
+	BackupVolumes       bool     `yaml:"backup_volumes"`
+	NativeRoot          string   `yaml:"native_root"`
+	Strategy            string   `yaml:"strategy"`
+	Hooks               Hooks    `yaml:"hooks"`
+	Paths               []string `yaml:"paths"`
+	AllowExcluded       bool     `yaml:"allow_excluded"`
+	Mirror              string   `yaml:"mirror"`
 }
 type Host struct {
+	AgentBinary  string            `yaml:"agent_binary"`
 	Name         string            `yaml:"name"`
 	Workers      int               `yaml:"workers"`
 	Policy       Policy            `yaml:"policy"`
@@ -58,6 +63,9 @@ type Destination struct {
 	KeepWeekly   int    `yaml:"keep_weekly"`
 }
 type Config struct {
+	RequirePoolSpace  bool          `yaml:"require_pool_space"`
+	HostID            string        `yaml:"host_id"`
+	MaxStagingBytes   uint64        `yaml:"max_staging_bytes"`
 	Legacy            bool          `yaml:"-"`
 	Version           int           `yaml:"version"`
 	Hosts             []string      `yaml:"hosts"`
@@ -79,7 +87,7 @@ type Config struct {
 }
 
 func readConfig(path string) (Config, error) {
-	c := Config{Version: 1, Workers: 1, StateDir: "./lxcer-state", Timeout: time.Hour, Compression: "none", MinFreeBytes: 1 << 30}
+	c := Config{Version: 1, Workers: 1, StateDir: "./lxcer-state", Timeout: time.Hour, Compression: "none", MinFreeBytes: 1 << 30, MaxStagingBytes: 32 << 30}
 	b, e := os.ReadFile(path)
 	if e != nil {
 		return c, e
@@ -144,8 +152,17 @@ func readConfig(path string) (Config, error) {
 	return c, c.Validate()
 }
 func validatePolicy(p Policy) error {
+	if p.MaxChain < 0 || p.MaxChain > 128 {
+		return errors.New("max_chain must be 0..128")
+	}
+	if p.IncrementalFallback != "" && p.IncrementalFallback != "fail" && p.IncrementalFallback != "full" {
+		return errors.New("incremental_fallback must be fail or full")
+	}
+	if p.SnapshotDir != "" && !filepath.IsAbs(p.SnapshotDir) {
+		return errors.New("snapshot_dir must be absolute")
+	}
 	switch p.Strategy {
-	case "", "auto", "full", "snapshot", "native", "incremental":
+	case "", "auto", "full", "snapshot", "native", "incremental", "storage-incremental":
 	default:
 		return fmt.Errorf("unknown strategy %q", p.Strategy)
 	}
@@ -173,6 +190,9 @@ func validatePolicy(p Policy) error {
 	return nil
 }
 func (c Config) Validate() error {
+	if c.HostID != "" && !validName(c.HostID) {
+		return errors.New("invalid host_id")
+	}
 	if c.Version != 1 {
 		return errors.New("unsupported configuration version")
 	}
@@ -201,6 +221,9 @@ func (c Config) Validate() error {
 			if e := validatePolicy(p); e != nil {
 				return e
 			}
+		}
+		if h.AgentBinary != "" && !filepath.IsAbs(h.AgentBinary) {
+			return errors.New("agent_binary must be an absolute path")
 		}
 		if h.SSH != "" && (!validName(h.SSH) || !filepath.IsAbs(h.RemoteConfig)) {
 			return errors.New("SSH requires a safe ssh-config alias and absolute remote_config")
@@ -240,6 +263,18 @@ func (c Config) Validate() error {
 	return nil
 }
 func mergePolicy(base, p Policy) Policy {
+	if p.StorageSource != "" {
+		base.StorageSource = p.StorageSource
+	}
+	if p.SnapshotDir != "" {
+		base.SnapshotDir = p.SnapshotDir
+	}
+	if p.MaxChain != 0 {
+		base.MaxChain = p.MaxChain
+	}
+	if p.IncrementalFallback != "" {
+		base.IncrementalFallback = p.IncrementalFallback
+	}
 	if p.BackupVolumes {
 		base.BackupVolumes = true
 	}

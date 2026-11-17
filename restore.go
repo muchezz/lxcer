@@ -12,6 +12,7 @@ import (
 )
 
 type RestoreOptions struct {
+	ReceiveDataset string
 	Start          bool
 	RestoreVolumes bool
 	Name           string
@@ -72,7 +73,8 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 	if !snapshotID(id) {
 		return errors.New("select a verified data snapshot ID")
 	}
-	if m.Strategy == "native" {
+	imageRebuild := m.Strategy == "native" || m.Strategy == "storage-incremental"
+	if m.Strategy == "native" && opt.NativeTarget != "" {
 		if opt.Test && len(opt.Health) > 0 {
 			return errors.New("native offline restore tests cannot execute instance health commands")
 		}
@@ -88,11 +90,23 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 		if _, err = os.Lstat(opt.NativeTarget); !os.IsNotExist(err) {
 			return errors.New("native restore target must not exist")
 		}
+		if err = privateDir(e.C.StateDir); err != nil {
+			return err
+		}
 		if err = os.MkdirAll(opt.NativeTarget, 0700); err != nil {
 			return err
 		}
-		_, err = r.run(ctx, "restore", id, "--target", opt.NativeTarget, "--verify")
+		offlineCtx, guard, stop := e.guard(ctx, opt.NativeTarget)
+		defer stop()
+		defer func() { result = errors.Join(result, context.Cause(offlineCtx)) }()
+		if err = guard.check(); err != nil {
+			return err
+		}
+		_, err = r.run(offlineCtx, "restore", id, "--target", opt.NativeTarget, "--verify")
 		if err != nil {
+			return err
+		}
+		if err = guard.check(); err != nil {
 			return err
 		}
 		for _, path := range m.Paths {
@@ -115,13 +129,18 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 			return errors.New("restore collision: choose another name; overwrite is intentionally unavailable")
 		}
 	}
-	if m.Strategy != "snapshot" && opt.Name != m.Instance.Name && !l.Caps.Has("backup_override_name") {
-		return errors.New("target cannot override backup instance name; use legacy image strategy or a capable target")
+	renameImport := !imageRebuild && m.Strategy != "snapshot" && opt.Name != m.Instance.Name && (!l.Caps.Has("backup_override_name") || !l.Caps.ImportName)
+	if renameImport {
+		for _, c := range cc {
+			if c.Name == m.Instance.Name {
+				return errors.New("legacy full import needs the original name free before rename; use a separate compatible host or an image backup")
+			}
+		}
 	}
 	if opt.Pool != "" && !validName(opt.Pool) {
 		return errors.New("invalid pool")
 	}
-	if opt.Pool != "" && m.Strategy != "snapshot" && !l.Caps.Has("container_backup_override_pool") {
+	if opt.Pool != "" && !imageRebuild && m.Strategy != "snapshot" && !l.Caps.Has("container_backup_override_pool") {
 		return errors.New("target cannot map backup storage pool")
 	}
 	if opt.Test {
@@ -129,6 +148,10 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 			return errors.New("restore-test requires an explicitly isolated, separate remote host and root-only profile")
 		}
 		b, er := l.run(ctx, "query", l.ref("/1.0/profiles/"+opt.Profile))
+		if er != nil {
+			return er
+		}
+		b, er = unwrapAPI(b)
 		if er != nil {
 			return er
 		}
@@ -164,6 +187,19 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 			}
 		}
 	}
+	if imageRebuild {
+		if m.Instance.Type == "virtual-machine" || m.Instance.Architecture == "" {
+			return errors.New("native reconstruction requires container architecture")
+		}
+		if m.Stream != nil {
+			if err = validateStream(*m); err != nil {
+				return err
+			}
+			if m.Stream.Driver == "zfs" && !datasetPattern.MatchString(opt.ReceiveDataset) {
+				return errors.New("ZFS reconstruction requires a disposable -receive-dataset")
+			}
+		}
+	}
 	if opt.DryRun {
 		return nil
 	}
@@ -175,6 +211,13 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 		return err
 	}
 	defer releaseLock(lock)
+	if renameImport {
+		originalLock, er := acquireLock(e.C.StateDir, opt.Host+"/"+m.Instance.Name)
+		if er != nil {
+			return er
+		}
+		defer releaseLock(originalLock)
+	}
 	owned := false
 	created := false
 	staging, err := os.MkdirTemp(e.C.StateDir, "restore-")
@@ -186,31 +229,63 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 			result = os.RemoveAll(staging)
 		}
 	}()
-	// Require exact archive containment; Restic restores the original absolute path beneath staging.
-	if m.Artifact == "" || !filepath.IsAbs(m.Artifact) {
-		return errors.New("manifest has no absolute artifact path")
-	}
-	if err = r.verify(ctx, id, []string{m.Artifact}); err != nil {
+	alias := newID()
+	journal, _ := json.Marshal(map[string]any{"version": 1, "id": alias, "source_job": m.ID, "target_host": opt.Host, "target_instance": opt.Name, "isolated_test": opt.Test, "status": "import pending", "original_name": m.Instance.Name, "rename_after_import": renameImport, "receive_parent": opt.ReceiveDataset, "receive_directory": filepath.Join(staging, "received")})
+	if err = atomicWrite(filepath.Join(staging, "restore.json"), journal); err != nil {
 		return err
-	}
-	if _, err = r.run(ctx, "restore", id, "--target", staging, "--include", m.Artifact, "--verify"); err != nil {
-		return err
-	}
-	artifact := filepath.Join(staging, strings.TrimPrefix(filepath.Clean(m.Artifact), "/"))
-	sum, _, err := checksum(artifact)
-	if err != nil {
-		return err
-	}
-	if sum != m.SHA256 {
-		return errors.New("restore archive checksum mismatch")
-	}
-	if strings.HasSuffix(artifact, ".zst") {
-		if _, err = e.R.Run(ctx, nil, nil, "zstd", "-d", "-T1", artifact, "-o", artifact+".tar"); err != nil {
-			return err
-		}
-		artifact += ".tar"
 	}
 
+	ctx, g, stopGuard := e.guard(ctx, staging)
+	defer stopGuard()
+	defer func() { result = errors.Join(result, context.Cause(ctx)) }()
+	if err = g.check(); err != nil {
+		return err
+	}
+	var artifact string
+	if imageRebuild {
+		root, release, er := e.reconstructNative(ctx, r, id, staging, *m, opt)
+		defer func() {
+			if result == nil {
+				result = errors.Join(result, release())
+			}
+		}()
+		if er != nil {
+			return er
+		}
+		artifact, err = e.nativeImage(ctx, root, staging, *m)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Require exact archive containment; Restic restores the original absolute path beneath staging.
+		if m.Artifact == "" || !filepath.IsAbs(m.Artifact) {
+			return errors.New("manifest has no absolute artifact path")
+		}
+		if err = r.verify(ctx, id, []string{m.Artifact}); err != nil {
+			return err
+		}
+		if _, err = r.run(ctx, "restore", id, "--target", staging, "--include", m.Artifact, "--verify"); err != nil {
+			return err
+		}
+		artifact = filepath.Join(staging, strings.TrimPrefix(filepath.Clean(m.Artifact), "/"))
+		sum, _, err := checksum(artifact)
+		if err != nil {
+			return err
+		}
+		if sum != m.SHA256 {
+			return errors.New("restore archive checksum mismatch")
+		}
+		if strings.HasSuffix(artifact, ".zst") {
+			if _, err = e.R.Run(ctx, nil, nil, "zstd", "-d", "-T1", artifact, "-o", artifact+".tar"); err != nil {
+				return err
+			}
+			artifact += ".tar"
+		}
+
+	}
+	if err = g.check(); err != nil {
+		return err
+	}
 	volumeNames := map[string]string{}
 	if opt.RestoreVolumes && !opt.Test {
 		for _, v := range m.Volumes {
@@ -254,11 +329,6 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 			volumeNames[v.Device] = newName
 		}
 	}
-	alias := newID()
-	journal, _ := json.Marshal(map[string]any{"version": 1, "id": alias, "source_job": m.ID, "target_host": opt.Host, "target_instance": opt.Name, "isolated_test": opt.Test, "status": "import pending"})
-	if err = atomicWrite(filepath.Join(staging, "restore.json"), journal); err != nil {
-		return err
-	}
 	defer func() {
 		if opt.Test && created && owned {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -267,8 +337,33 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 			result = errors.Join(result, er)
 		}
 	}()
-	if m.Strategy == "snapshot" {
-		if _, err = l.run(ctx, "image", "import", artifact, l.ref(""), "--alias", alias); err != nil {
+	if m.Strategy == "snapshot" || imageRebuild {
+		importArgs := []string{"image", "import", artifact}
+		for _, part := range m.ImageParts {
+			if !filepath.IsAbs(part.Artifact) || filepath.Base(filepath.Dir(part.Artifact)) != m.ID {
+				return errors.New("split image ownership mismatch")
+			}
+			if err = r.verify(ctx, id, []string{part.Artifact}); err != nil {
+				return err
+			}
+			if _, err = r.run(ctx, "restore", id, "--target", staging, "--include", part.Artifact, "--verify"); err != nil {
+				return err
+			}
+			path := filepath.Join(staging, strings.TrimPrefix(filepath.Clean(part.Artifact), "/"))
+			sum, _, er := checksum(path)
+			if er != nil {
+				return er
+			}
+			if sum != part.SHA256 {
+				return errors.New("split image checksum mismatch")
+			}
+			importArgs = append(importArgs, path)
+		}
+		importArgs = append(importArgs, l.ref(""), "--alias", alias)
+		if err = g.check(); err != nil {
+			return err
+		}
+		if _, err = l.run(ctx, importArgs...); err != nil {
 			return err
 		}
 		a := []string{"init", l.ref(alias), l.ref(opt.Name), "-c", "boot.autostart=false", "-c", "user.lxcer.restore=" + alias}
@@ -288,7 +383,7 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 		}
 	} else {
 		a := []string{"import", l.ref(""), artifact}
-		if l.Caps.Has("backup_override_name") {
+		if l.Caps.Has("backup_override_name") && l.Caps.ImportName {
 			a = append(a, opt.Name)
 		}
 		if opt.Pool != "" {
@@ -298,6 +393,11 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 			return err
 		}
 		created = true
+		if renameImport {
+			if _, err = l.run(ctx, "move", l.ref(m.Instance.Name), l.ref(opt.Name)); err != nil {
+				return err
+			}
+		}
 	}
 	// Construct configuration explicitly; do not inherit source host profiles or autostart.
 	cfg := map[string]string{}
@@ -430,7 +530,7 @@ func (e Engine) recoverJobs(ctx context.Context, execute bool) error {
 			}
 			if execute {
 				if m.NeedsResume {
-					l := LXD{R: e.R, Host: m.Host}
+					l := LXD{R: e.R, Host: sourceRemote(m)}
 					if er = e.hooks(ctx, l, m.Instance, m.ResumeHooks); er != nil {
 						releaseLock(lock)
 						return er
@@ -455,9 +555,15 @@ func (e Engine) recoverJobs(ctx context.Context, execute bool) error {
 		if m.State == Verified {
 			fmt.Printf("%s eligible for cleanup\n", m.ID)
 			if execute {
+				lock, lockErr := acquireLock(e.C.StateDir, m.Host+"/"+m.Instance.Name)
+				if lockErr != nil {
+					continue
+				}
 				if er = e.cleanup(ctx, &m, filepath.Dir(f), false); er != nil {
+					releaseLock(lock)
 					return er
 				}
+				releaseLock(lock)
 			}
 		}
 	}

@@ -192,6 +192,9 @@ func TestCLINonzeroAndVersion(t *testing.T) {
 func TestScopedRetention(t *testing.T) {
 	var captured string
 	r := Repository{D: Destination{Name: "d", Path: "r", KeepLast: 3}, R: runnerFunc(func(_ context.Context, _ []string, _ []byte, _ string, a ...string) ([]byte, error) {
+		if a[0] == "snapshots" {
+			return []byte("[]"), nil
+		}
 		captured = strings.Join(a, " ")
 		return nil, nil
 	})}
@@ -249,10 +252,13 @@ func TestSSHAgentCommandQuotingAndFailure(t *testing.T) {
 	e := testEngine(t, f)
 	e.C.Destinations = nil
 	path := "/etc/lxcer/a'$(touch nope).yml"
-	if er := e.Backup(context.Background(), []Host{{Name: "source", SSH: "source-agent", RemoteConfig: path}}, "stopped"); er == nil {
+	if er := e.Backup(context.Background(), []Host{{Name: "source", SSH: "source-agent", AgentBinary: "/opt/lxcer/new binary", RemoteConfig: path}}, "stopped"); er == nil {
 		t.Fatal("failed agent reported success")
 	}
 	call := strings.Join(f.calls, "\n")
+	if !strings.Contains(call, shellQuote("/opt/lxcer/new binary")) || !strings.Contains(call, "version >/dev/null &&") {
+		t.Fatal("agent relied on production PATH or skipped version preflight")
+	}
 	if !strings.Contains(call, "StrictHostKeyChecking=yes") || !strings.Contains(call, shellQuote(path)) {
 		t.Fatal(call)
 	}

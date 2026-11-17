@@ -62,7 +62,7 @@ func (e Engine) writeMetrics() error {
 		}
 	}
 	var b strings.Builder
-	types := map[string]string{"lxcer_backup_success": "gauge", "lxcer_backup_last_success_timestamp_seconds": "gauge", "lxcer_backup_duration_seconds": "gauge", "lxcer_backup_size_bytes": "gauge", "lxcer_backup_failures_total": "counter", "lxcer_backup_jobs_running": "gauge", "lxcer_backup_verification_failures_total": "counter", "lxcer_restore_test_success": "gauge", "lxcer_restore_test_duration_seconds": "gauge"}
+	types := map[string]string{"lxcer_backup_upload_bytes": "gauge", "lxcer_backup_capture_duration_seconds": "gauge", "lxcer_backup_staging_peak_bytes": "gauge", "lxcer_backup_chain_length": "gauge", "lxcer_backup_success": "gauge", "lxcer_backup_last_success_timestamp_seconds": "gauge", "lxcer_backup_duration_seconds": "gauge", "lxcer_backup_size_bytes": "gauge", "lxcer_backup_failures_total": "counter", "lxcer_backup_jobs_running": "gauge", "lxcer_backup_verification_failures_total": "counter", "lxcer_restore_test_success": "gauge", "lxcer_restore_test_duration_seconds": "gauge"}
 	keys := make([]string, 0, len(types))
 	for k := range types {
 		keys = append(keys, k)
@@ -77,6 +77,16 @@ func (e Engine) writeMetrics() error {
 	for _, g := range groups {
 		m := g.latest
 		l := label(m)
+		fmt.Fprintf(&b, "lxcer_backup_capture_duration_seconds%s %g\nlxcer_backup_staging_peak_bytes%s %d\n", l, m.CaptureSeconds, l, m.StagingPeakBytes)
+		chain := 0
+		if m.Stream != nil {
+			chain = len(m.Stream.Parents) + 1
+		}
+		fmt.Fprintf(&b, "lxcer_backup_chain_length%s %d\n", l, chain)
+		for _, d := range m.Destinations {
+			dl := strings.TrimSuffix(l, "}") + ",destination=" + strconv.Quote(d.Name) + "}"
+			fmt.Fprintf(&b, "lxcer_backup_upload_bytes%s %d\n", dl, d.UploadBytes)
+		}
 		success := 0
 		if m.State == Verified {
 			success = 1

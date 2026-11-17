@@ -29,6 +29,7 @@ func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 	legacyFlags := len(args) > 0 && strings.HasPrefix(args[0], "-")
 	f := flag.NewFlagSet("lxcer", flag.ContinueOnError)
 	f.SetOutput(errOut)
+	sourceID := f.String("source-id", "", "stable identity of a source-side local agent")
 	sourceHost := f.String("source-host", "", "catalog source host filter")
 	legacy := f.Bool("legacy", false, "include pre-modernization repository snapshots in discovery")
 	legacyMetadata := f.String("legacy-metadata", "", "JSON instance metadata for adopting an old archive")
@@ -54,6 +55,7 @@ func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 	health := f.String("health-argv", "", "optional JSON argv health check inside isolated test instance")
 	target := f.String("target", "", "new catalog recovery directory")
 	restoreVolumes := f.Bool("restore-volumes", false, "restore exported managed volumes under new names")
+	receiveDataset := f.String("receive-dataset", "", "disposable ZFS parent dataset for stream reconstruction")
 	nativeTarget := f.String("native-target", "", "new filesystem restore directory")
 	defaultLevel := "info"
 	if legacyFlags {
@@ -102,6 +104,12 @@ func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 	if *action == "validate" {
 		fmt.Fprintln(out, "configuration valid")
 		return 0
+	}
+	if *sourceID != "" {
+		if !*local || !validName(*sourceID) {
+			return fail(errors.New("-source-id requires -local and a safe identity"))
+		}
+		c.HostID = *sourceID
 	}
 	if !*concurrent {
 		c.Workers = 1
@@ -259,7 +267,7 @@ func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 			}
 		}
 		legacyRestore := legacyFlags && c.Legacy
-		o := RestoreOptions{Start: legacyRestore && !*stopped, RestoreVolumes: *restoreVolumes, Name: *as, Host: selectedHost, Destination: restoreDestination, Snapshot: *snapshot, Pool: *pool, Networks: ns, DryRun: *action == "restore-plan", Test: *action == "restore-test", Isolated: *isolated, Profile: *profile, Health: argv, NativeTarget: *nativeTarget}
+		o := RestoreOptions{ReceiveDataset: *receiveDataset, Start: legacyRestore && !*stopped, RestoreVolumes: *restoreVolumes, Name: *as, Host: selectedHost, Destination: restoreDestination, Snapshot: *snapshot, Pool: *pool, Networks: ns, DryRun: *action == "restore-plan", Test: *action == "restore-test", Isolated: *isolated, Profile: *profile, Health: argv, NativeTarget: *nativeTarget}
 
 		pairs := map[string]string{}
 		if *restoreList != "" {
@@ -365,7 +373,7 @@ func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 			if selectedHost == "" || *name == "" {
 				err = errors.New("retention requires explicit host and container scope")
 			} else {
-				err = e.repo(d).retention(ctx, selectedHost, *name, !*execute)
+				err = e.repo(d).chainRetention(ctx, selectedHost, *name, !*execute)
 			}
 		}
 	default:

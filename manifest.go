@@ -28,6 +28,7 @@ const (
 )
 
 type DestinationStatus struct {
+	UploadBytes      int64  `json:"upload_bytes"`
 	Name             string `json:"name"`
 	Required         bool   `json:"required"`
 	SnapshotID       string `json:"snapshot_id,omitempty"`
@@ -51,33 +52,47 @@ type VolumeArtifact struct {
 	SHA256   string `json:"sha256"`
 	Size     int64  `json:"size_bytes"`
 }
+type ImagePart struct {
+	Artifact string `json:"artifact"`
+	SHA256   string `json:"sha256"`
+	Size     int64  `json:"size_bytes"`
+}
 type Manifest struct {
-	ImageFingerprint string              `json:"image_fingerprint,omitempty"`
-	Legacy           bool                `json:"legacy,omitempty"`
-	Volumes          []VolumeArtifact    `json:"volumes,omitempty"`
-	NeedsResume      bool                `json:"needs_resume"`
-	ResumeHooks      []Hook              `json:"resume_hooks,omitempty"`
-	Version          int                 `json:"version"`
-	ID               string              `json:"id"`
-	Host             string              `json:"host"`
-	Instance         Container           `json:"instance"`
-	Capabilities     Capabilities        `json:"capabilities"`
-	Storage          string              `json:"storage"`
-	Strategy         string              `json:"strategy"`
-	State            State               `json:"state"`
-	Started          time.Time           `json:"started"`
-	Completed        time.Time           `json:"completed,omitempty"`
-	Size             int64               `json:"size_bytes"`
-	SHA256           string              `json:"sha256,omitempty"`
-	Artifact         string              `json:"artifact,omitempty"`
-	Paths            []string            `json:"paths,omitempty"`
-	Attachments      []Attachment        `json:"attachments"`
-	Destinations     []DestinationStatus `json:"destinations"`
-	Error            string              `json:"error,omitempty"`
-	Cleanup          string              `json:"cleanup"`
-	Snapshot         string              `json:"snapshot,omitempty"`
-	ImageAlias       string              `json:"image_alias,omitempty"`
-	RestoreTest      *RestoreTest        `json:"restore_test,omitempty"`
+	PoolFreeBytes      int64               `json:"pool_free_bytes"`
+	PoolPreflightError string              `json:"pool_preflight_error,omitempty"`
+	LXDRemote          string              `json:"lxd_remote,omitempty"`
+	ImageParts         []ImagePart         `json:"image_parts,omitempty"`
+	NativeRoot         string              `json:"native_root,omitempty"`
+	Stream             *StreamBackup       `json:"stream,omitempty"`
+	FallbackReason     string              `json:"fallback_reason,omitempty"`
+	CaptureSeconds     float64             `json:"capture_seconds"`
+	StagingPeakBytes   int64               `json:"staging_peak_bytes"`
+	ImageFingerprint   string              `json:"image_fingerprint,omitempty"`
+	Legacy             bool                `json:"legacy,omitempty"`
+	Volumes            []VolumeArtifact    `json:"volumes,omitempty"`
+	NeedsResume        bool                `json:"needs_resume"`
+	ResumeHooks        []Hook              `json:"resume_hooks,omitempty"`
+	Version            int                 `json:"version"`
+	ID                 string              `json:"id"`
+	Host               string              `json:"host"`
+	Instance           Container           `json:"instance"`
+	Capabilities       Capabilities        `json:"capabilities"`
+	Storage            string              `json:"storage"`
+	Strategy           string              `json:"strategy"`
+	State              State               `json:"state"`
+	Started            time.Time           `json:"started"`
+	Completed          time.Time           `json:"completed,omitempty"`
+	Size               int64               `json:"size_bytes"`
+	SHA256             string              `json:"sha256,omitempty"`
+	Artifact           string              `json:"artifact,omitempty"`
+	Paths              []string            `json:"paths,omitempty"`
+	Attachments        []Attachment        `json:"attachments"`
+	Destinations       []DestinationStatus `json:"destinations"`
+	Error              string              `json:"error,omitempty"`
+	Cleanup            string              `json:"cleanup"`
+	Snapshot           string              `json:"snapshot,omitempty"`
+	ImageAlias         string              `json:"image_alias,omitempty"`
+	RestoreTest        *RestoreTest        `json:"restore_test,omitempty"`
 }
 
 func newID() string {
@@ -178,6 +193,14 @@ func loadManifest(path string) (Manifest, error) {
 		}
 		if !m.Legacy && m.Artifact != "" && (!filepath.IsAbs(m.Artifact) || filepath.Base(filepath.Dir(m.Artifact)) != m.ID) {
 			return m, errors.New("artifact ownership mismatch")
+		}
+		if m.LXDRemote != "" && !validName(m.LXDRemote) {
+			return m, errors.New("invalid source remote")
+		}
+		if m.Stream != nil {
+			if err := validateStream(m); err != nil {
+				return m, err
+			}
 		}
 		for _, v := range m.Volumes {
 			if !validName(v.Device) || !validName(v.Name) || !validName(v.Pool) || !filepath.IsAbs(v.Artifact) || filepath.Base(filepath.Dir(v.Artifact)) != m.ID {

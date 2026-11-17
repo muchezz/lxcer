@@ -61,7 +61,7 @@ func TestRestorePlanDoesNotMutate(t *testing.T) {
 		t.Fatal(er)
 	}
 	for _, call := range f.calls[before:] {
-		if strings.HasPrefix(call, "restic restore") || strings.HasPrefix(call, "lxc import ") {
+		if strings.HasPrefix(call, "restic restore") || (strings.HasPrefix(call, "lxc import ") && call != "lxc import --help") {
 			t.Fatal("dry run mutated resources")
 		}
 	}

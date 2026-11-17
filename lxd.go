@@ -20,6 +20,7 @@ type Container struct {
 	Architecture    string                       `json:"architecture"`
 }
 type Capabilities struct {
+	ImportName       bool     `json:"import_name"`
 	Server           string   `json:"server"`
 	Client           string   `json:"client"`
 	Extensions       []string `json:"extensions"`
@@ -79,13 +80,18 @@ func (l *LXD) Detect(ctx context.Context) error {
 	}
 	b, e = l.run(ctx, "version")
 	if e != nil {
-		return e
+		b, e = l.run(ctx, "--version")
+		if e != nil {
+			return e
+		}
 	}
 	l.Caps.Client = strings.TrimSpace(string(b))
 	b, e = l.run(ctx, "export", "--help")
 	l.Caps.Export = e == nil && strings.Contains(string(b), "export") && l.Caps.Has("container_backup")
 	b, e = l.run(ctx, "copy", "--help")
 	l.Caps.Refresh = e == nil && strings.Contains(string(b), "--refresh") && l.Caps.Has("container_incremental_copy")
+	b, e = l.run(ctx, "import", "--help")
+	l.Caps.ImportName = e == nil && (strings.Contains(string(b), "instance name") || strings.Contains(string(b), "container name"))
 	l.Caps.InstanceEndpoint = l.Caps.Has("instances")
 	return nil
 }
@@ -204,11 +210,18 @@ func chooseStrategy(p Policy, cap Capabilities, c Container) (string, error) {
 		if !cap.Refresh || p.Mirror == "" {
 			return "", errors.New("incremental requires refresh capability and mirror remote")
 		}
+	case "storage-incremental":
+		if c.Type == "virtual-machine" {
+			return "", errors.New("storage filesystem streams currently require containers")
+		}
+		if (p.StorageSource == "" || p.NativeRoot == "") && p.IncrementalFallback != "full" {
+			return "", errors.New("storage-incremental requires explicit storage_source and native_root")
+		}
 	case "native":
 		if p.NativeRoot == "" {
 			return "", errors.New("native requires native_root: the source root filesystem directory")
 		}
-		if len(p.Paths) == 0 {
+		if len(p.Paths) == 0 && p.NativeRoot == "" {
 			return "", errors.New("native requires explicit filesystem paths")
 		}
 		if c.StatusCode == 103 && len(p.Hooks.Quiesce) == 0 {
@@ -229,4 +242,15 @@ func effectiveConfig(c Container) map[string]string {
 		cfg[k] = v
 	}
 	return cfg
+}
+
+func unwrapAPI(b []byte) ([]byte, error) {
+	var wrapper map[string]json.RawMessage
+	if err := json.Unmarshal(b, &wrapper); err != nil {
+		return nil, err
+	}
+	if meta, ok := wrapper["metadata"]; ok && len(meta) > 0 && string(meta) != "null" {
+		return meta, nil
+	}
+	return b, nil
 }

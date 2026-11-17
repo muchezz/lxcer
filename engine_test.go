@@ -238,6 +238,9 @@ func (f *fakeRunner) Run(ctx context.Context, env []string, in []byte, cmd strin
 			return nil, nil
 		}
 	case "import":
+		if len(a) > 1 && a[1] == "--help" {
+			return []byte("[<remote>:] <backup file> [<instance name>] --storage"), nil
+		}
 		if len(a) < 4 || !strings.HasSuffix(a[1], ":") {
 			return nil, errors.New("invalid import argument order")
 		}
@@ -281,6 +284,19 @@ func (f *fakeRunner) Run(ctx context.Context, env []string, in []byte, cmd strin
 			}
 		}
 		return nil, nil
+	case "move":
+		h, n := splitRef(a[1])
+		dh, dn := splitRef(a[2])
+		if h != dh {
+			return nil, errors.New("fake only models same-host rename")
+		}
+		for i, c := range f.instances[h] {
+			if c.Name == n {
+				f.instances[h][i].Name = dn
+				return nil, nil
+			}
+		}
+		return nil, errors.New("rename source missing")
 	case "delete":
 		host, n := splitRef(a[1])
 		var cc []Container
