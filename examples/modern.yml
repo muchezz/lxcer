@@ -27,6 +27,7 @@ inventory:
               timeout: 2m
   - name: backup-agent
     ssh: backup-agent
+    agent_binary: /opt/lxcer/lxcer
     remote_config: /etc/lxcer/agent.yml
     workers: 1
 destinations:

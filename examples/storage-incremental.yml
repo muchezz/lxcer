@@ -1,0 +1,28 @@
+version: 1
+# Keep staging and source snapshots outside the source subvolume.
+state_dir: /srv/lxcer-private
+max_staging_bytes: 34359738368
+min_free_bytes: 10737418240
+require_pool_space: true
+workers: 1
+timeout: 2h
+compression: none
+inventory:
+  - name: local
+    instances:
+      app:
+        strategy: storage-incremental
+        # Identify the actual instance subvolume/dataset in a disposable environment.
+        storage_source: /srv/lxd-source/containers/app
+        native_root: /srv/lxd-source/containers/app/rootfs
+        snapshot_dir: /srv/lxcer-snapshots
+        max_chain: 8
+        incremental_fallback: fail
+policy:
+  strategy: snapshot
+destinations:
+  - name: required
+    path: sftp:storagebox:/home/lxcer
+    password_env: LXCER_RESTIC_PASSWORD
+    keep_last: 3
+    keep_weekly: 8

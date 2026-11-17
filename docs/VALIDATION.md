@@ -1,103 +1,95 @@
-# Implementation and validation report
+# LXCER critical-gap validation
 
-Local implementation branch: `feat/lxcer-modernization` in the existing fork `https://github.com/muchezz/lxcer`. Upstream remains `https://github.com/pavel1337/lxcer`. Base `eba7adc`. Original author/module/history preserved. No push, PR, release publication, production backup/restore, production LXD connection, or replacement of `/usr/local/bin/lxcer` occurred.
+Branch: `feat/lxcer-modernization`, fork `muchezz/lxcer`. This work continues from `5351441` and preserves all seven earlier modernization commits. No rewrite/restart, production LXD access, production credential access, push, deployment, PR or release publication occurred. `/usr/local/bin/lxcer` was not replaced.
 
-## Implemented
+## Production-readiness assessment
 
-- One modular engine replaces the duplicated pipelines: consistent running/stopped selection, missing/empty-selection errors, nonzero failure/partial exits, bounded host/global workers, process locks, signal cancellation, retries and disk preflight.
-- Client/server capability adapters select portable full export, legacy snapshot/image, source-side native filesystem, or mirror refresh workflows. Root drivers and expanded attachments are inventoried. Explicit bind paths and supported managed volume exports are included with per-artifact checksums.
-- Private durable versioned manifests and tagged repository receipts record job state, configuration, coverage, destination snapshot IDs, verification levels, errors, cleanup and restore tests. Required verification gates cleanup. Interrupted quiescence can be resumed through recovery.
-- Restic repositories use secure environment/file credential sources, independent required/optional status, JSON snapshot identity, tree-path verification, optional data checks and scoped dry-run retention. Local/SFTP/rclone/object-storage locations use Restic's native backend support.
-- Original unversioned configuration keeps snapshot/image/zstd defaults and instance archive names. Original restore flags, restore repository/credentials, automatic startup/logging and concurrent restore lists are regression-tested against old and cataloged archives. Modern restore commands remain stopped by default.
-- Safe modern stopped restore, exact snapshot selection, archive checksum verification, pool/network remapping, managed volume collision handling, legacy adoption, multi-entry restore lists, isolated health tests, catalog recovery and retained failure journals.
-- Structured logs, atomic Prometheus textfile metrics, alert rules/Grafana examples, one-shot systemd scheduling, CI/security checks and manual-only release artifact preparation.
+**FAIL — not cleared for production deployment.** The implementation and available local checks are complete, but no disposable LXD servers, SFTP test repository or privileged disposable storage environment were supplied. Every real LXD/storage combination remains **NOT VERIFIED**. Qualify the guarded workflows, provision scratch quotas/space and validate application recovery before deploying.
 
-## Tests actually executed
+PASS means the named check actually passed at the stated layer. It does not promote mocked commands to real daemon or storage verification. NOT VERIFIED means the required infrastructure/evidence is absent.
 
-Environment: Linux AMD64, Go **1.26.11**, Restic **0.16.4**, zstd **1.5.5**. Only temporary local Restic repositories and simulated LXD commands were used.
+## Implemented fixes and executable evidence
 
-| Check | Result |
-|---|---|
-| Original baseline | Built; no original tests |
-| Added baseline regression before changes | Failed as expected: stopped instance excluded |
-| Final `go test -race -json -coverprofile=... ./...` | **69 cases passed (37 top-level tests), no skips/failures; 76.0% statements** |
-| Real Restic workflows | Full + actual zstd/decompression, legacy image, and native filesystem backup/verify/restore; `check --read-data` passed |
-| Fault and policy tests | Snapshot/export/compression/upload/tree/receipt failures, partial destinations, stopped/missing instances, hooks/resume, lock/concurrency, disk preflight, exclusion, restore/collision/config/health/checksum errors, recovery, legacy adoption, bind paths, managed volumes, refresh mirrors, SSH quoting, secrets and retention scope |
-| `gofmt`, `go vet`, staticcheck v0.8.2 | Passed |
-| Final password-file override regression | Passed with race-enabled short suite; replaces an existing password environment source |
-| govulncheck v1.9.0 | No vulnerabilities found |
-| Linux AMD64/ARM64 build | Both built; AMD64 CLI version/config validation executed; ARM64 execution unverified |
-| Disposable LXD integration harness | Compiled and safely skipped without explicitly supplied test infrastructure |
-| GitHub-hosted workflows | Prepared; not remotely executed because nothing was pushed |
+| Workstream | Status | Implementation/evidence |
+|---|---|---|
+| LXD 3.0.3 / 4.0 / 5.0 / 6.x adapters | PASS: command models | API extensions plus client command help select image/full operations. 3.0.3 never executes `lxc export`. Client name-override capability is negotiated. |
+| Running/stopped backup and restore | PASS: command models | 40 version × driver × state cases; exact selection, old import-then-rename and isolated stopped targets. |
+| Storage detection | PASS: command models | Btrfs/ZFS/LVM/dir/Ceph paths; unsupported native incrementals fail or explicitly fall back. Source capacity is recorded or marked unknown. Strict mode rejects unknown capacity. |
+| Automated native reconstruction | PASS: real local Restic/GNU tar, modeled LXD | Native roots restore to private staging, build a unified image, import/init and validate metadata/ownership. Captured ID maps, ACL IDs, capability root IDs and symlinks have focused coverage. |
+| Native Btrfs/ZFS incrementals | PASS: command/state models | Full then `btrfs send -p` / `zfs send -i`, immutable snapshots, persisted parents/checkpoints, checksum-verified receive, bounded output. No repeated full LXD export. |
+| Recoverable chains and fallback | PASS: models | Missing required parents fail; explicit full restart removes broken dependencies. Optional repositories cannot verify a child without parents. Retention groups whole chains and protects unfinished chains. |
+| Archive correctness | PASS | Unified/split exports, checksums, missing/empty exports, failed compression, no snapshot ID, absent tree nodes, partial destinations and receipt failures. |
+| Space/preflight | PASS: local/fault tests | 32 GiB configurable monitored staging default, live free-space checks, bounded stream writer, source-pool exhaustion rejection and recursive source/state exclusion. |
+| Recovery/locking | PASS: models/local kernel locks | Duplicate locks rejected, interrupted hooks resumed, verified checkpoints survive cleanup-only errors, active jobs excluded from cleanup. |
+| Observability/security/coexistence | PASS: local | Structured logs, secret sources, atomic readable metrics, upload/capture/staging/chain gauges, alert rules and explicit quoted SSH agent binary paths. Original config/flags/startup/archive workflows retained. |
+| Realistic legacy scenario harness | PASS: compilation/guards; execution NOT VERIFIED | Two disposable hosts, exact 3.0.3/Btrfs source, running payload/heartbeat and stopped instance, one required SFTP destination, checksum restore, injected missing tree must exit nonzero and retain artifacts. |
+| Actual application/database consistency | NOT VERIFIED | Hooks execute and failures/resume are tested; real PostgreSQL/MySQL/MongoDB/GitLab recovery needs deployment-specific qualification. |
 
-## Compatibility evidence and limits
+## Tests and quality results
 
-No real LXD release or Btrfs/ZFS/LVM/directory/Ceph backend was qualified. Simulations cover 3.0.3, 4.0, 5.0, 5.21, 6.0, future version strings and all five driver identities, including old-client/modern-server capability mismatches. These establish adapter decisions, not real server compatibility. The guarded disposable matrix remains required before claiming production support.
+Environment: Linux AMD64, Go 1.26.11, Restic 0.16.4, zstd 1.5.5 and GNU tar. Default tests used temporary local repositories and simulated LXD/storage commands. No default LXD daemon was contacted.
 
-Native mode restores files into a new directory; automatic LXD reconstruction from raw filesystem trees is deliberately unavailable. Refresh incrementals delegate transfer optimization to LXD and still create a full mirror export; no storage-native delta archive chain or direct multi-repository streaming is implemented. LXD/SSH transfer bandwidth needs external/server-side controls. Failed resources are retained for review; shared content-addressed images and persistent mirrors are not automatically deleted. Modern automatic restores reject bind/excluded storage dependencies until those are recovered/remapped through a reviewed administrative workflow. Hook scripts and application recovery checks must match the actual application installation. There is no production application verification from these tests.
+| Check | Status | Recorded result |
+|---|---|---|
+| One complete race/coverage run | FAIL initially: obsolete test assertion | 127 cases: 126 passed, one dry-run assertion failed because it classified `lxc import --help` as a mutation. No data race warnings. Measured coverage **71.9%**. |
+| Corrected assertion and final short/race suite | PASS | **123 cases passed, 3 deliberately slow integration tests skipped**, 55 top-level tests including the new cases; measured short-suite coverage **66.9%**. The capability probe is read-only; the assertion now distinguishes it from import. |
+| Full local Restic export/zstd/restore | PASS | Full archive round trip, repository data check and decompression; 11.94 s in the complete run. LXD operations modeled. |
+| Local legacy image/Restic round trip | PASS | Image archive backup/verification/restore; 11.86 s. LXD operations modeled. |
+| Local native filesystem/Restic round trip | PASS | Raw filesystem restore with Restic data verification; 9.81 s. |
+| Automated native image reconstruction | PASS | Real Restic restore plus real GNU tar, modeled init/config/health/cleanup; 8.83 s. |
+| Original flag/config/archive compatibility | PASS | Real Restic/zstd, old archives and new catalog, automatic legacy startup, concurrent restore lists; 17.98 s. LXD operations modeled. |
+| `gofmt`, `go vet`, staticcheck v0.8.2 | PASS | Static naming warnings corrected; final source checks clean. |
+| govulncheck v1.9.0 | PASS | No vulnerabilities found. Dependencies unchanged after scanning. |
+| actionlint v1.7.7 | PASS | Disposable custom runner label declared; all workflow definitions validated. |
+| Real LXD/SFTP/kernel harnesses | NOT VERIFIED | All three compiled and skipped because disposable opt-in/infrastructure was absent. Explicit opt-in with invalid prerequisites fails instead of reporting a green skip. |
+| Linux AMD64/ARM64 artifacts | PASS builds/checksums | Built once from implementation commit `94620f1`; AMD64 version/config commands passed. ARM64 execution remains NOT VERIFIED. |
+| GitHub-hosted workflow execution | NOT VERIFIED | Workflows prepared locally; no push or remote workflow execution. |
 
-A root-only profile plus a separate remote flag cannot prove physical isolation: the operator must supply an actual isolated host. Locks coordinate a shared source state directory, not independent controllers. Subprocess error output is suppressed to protect secrets; raw stderr is not retained. Original license terms still need clarification before release redistribution.
+The slow real Restic cases all passed during the full run and were not repeated after the test-only assertion fix. Final short/focused checks cover the subsequent mountpoint, coexistence and recursive-state safeguards. Across those runs, all 129 current cases have passing evidence at their stated layer. Coverage values are separate measurements, not a fabricated merged/final-full result. No extra long benchmark or repeated full suite was run.
 
-## Prepared commits and upstream structure
+## Verified LXD versions and storage backends
 
-- `4611924`: baseline audit and stopped-container regression.
-- `cc0864a`: working backup/restore engine and automated tests.
-- `c2cafb1`: CI, release scripts, monitoring and scheduling examples.
-- `d0975b2`: isolation/image ownership hardening and compressed recovery testing.
-- `ed8f3b4`: architecture, compatibility, migration, operations, GitLab/Storage Box example and upstream review descriptions.
-- `e01bee5`: preserve original config/CLI/archive behavior; expanded profile settings, original backup timestamps, readable metrics and source-only agent credentials.
-- Final validation/credential override commit: see `git log`.
+| Target | Adapter tests | Real daemon/backend workflow |
+|---|---|---|
+| LXD 3.0.x, especially 3.0.3 | PASS for 3.0.3 model, generic capability fixtures | NOT VERIFIED |
+| LXD 4.0 LTS | PASS model including import-then-rename | NOT VERIFIED |
+| LXD 5.0 LTS / modern 5.x | PASS models/capability fixtures | NOT VERIFIED |
+| LXD 6.x | PASS models/capability fixtures | NOT VERIFIED |
+| Btrfs | PASS portable + stream command models | NOT VERIFIED |
+| ZFS | PASS portable + send/receive + legacy-mountpoint models | NOT VERIFIED |
+| LVM | PASS portable/explicit fallback models | NOT VERIFIED |
+| Directory | PASS portable/explicit fallback models | NOT VERIFIED |
+| Ceph | PASS portable/explicit fallback models | NOT VERIFIED |
+| Restic local repository | PASS real temporary repositories | PASS local data checks/recovery |
+| Restic SFTP / rclone / object stores | Native Restic backend pass-through; SFTP harness implemented | NOT VERIFIED |
 
-Suggested upstream review sequence: baseline regression; engine/compatibility/recovery (optionally split recovery at review time); operations/CI/release preparation. The full PR descriptions and backward-incompatible behavior are documented in DEVELOPMENT.md. All commits remain local until the fork owner approves pushing/submission.
+Btrfs tooling was available but no explicitly disposable filesystem was configured. ZFS tooling/environment was absent. The installed LXC client was not used to inspect the default/production daemon.
 
-## Changed files
+## Incremental capabilities and measurements
 
-Original versions of replaced legacy files remain in Git history.
+- `storage-incremental` produces genuine source-side Btrfs/ZFS parent-relative streams. `incremental` retains the original mirror-refresh/full-export semantics for compatibility; Restic deduplication is not labeled a source incremental.
+- Manifests record stream kind, dependencies, SHA256, size, capture duration, staging peak, packed upload bytes and available referenced/exclusive snapshot bytes. Missing driver measurements use `-1`.
+- The protocol model deliberately emits a 32 KiB full stream and 1 KiB delta. **These are simulated sizes, not measured Btrfs/ZFS performance.** Real transfer reduction, storage consumption and timing remain NOT VERIFIED until the kernel harness runs.
+- The real kernel harness writes 8 MiB, changes 4 KiB in place, replays the chain through Restic, validates the recovered image payload and reports sizes/durations. Its LXD import remains modeled; real LXD qualification is separate.
+- Full-chain rotation defaults to eight members. Retention cannot prune retained parents. Missing parents fail unless a full restart was explicitly configured. Source snapshots advance only after successful required verification/receipts.
 
-```text
-A	.github/workflows/ci.yml
-A	.github/workflows/lxd-integration.yml
-A	.github/workflows/release.yml
-M	.gitignore
-M	README.md
-A	baseline_test.go
-A	catalog.go
-M	conf.yml
-M	config.go
-D	container.go
-A	core_test.go
-A	docs/APPLICATIONS.md
-A	docs/ARCHITECTURE.md
-A	docs/BASELINE.md
-A	docs/COMPATIBILITY.md
-A	docs/CONFIGURATION.md
-A	docs/DEVELOPMENT.md
-A	docs/OPERATIONS.md
-A	docs/RESTORE.md
-A	docs/VALIDATION.md
-A	engine.go
-A	engine_test.go
-A	examples/lxcer.service
-A	examples/lxcer.timer
-A	examples/modern.yml
-M	go.mod
-M	go.sum
-D	host.go
-D	image.go
-A	legacy.go
-A	legacy_test.go
-A	lxd.go
-A	lxd_integration_test.go
-M	main.go
-A	manifest.go
-A	metrics.go
-A	monitoring/alerts.yml
-A	monitoring/grafana.json
-A	restic.go
-D	restic_repo.go
-A	restore.go
-A	restore_test.go
-A	runner.go
-A	scripts/build-release.sh
-D	util.go
-```
+## Remaining operational risks
+
+1. **Real interoperability is NOT VERIFIED.** Run the disposable version/driver matrix, real kernel stream harness and two-host legacy SFTP scenario before production. They cannot establish actual application recovery without relevant health procedures.
+2. Native reconstruction needs correct architecture/root/ID-map metadata, GNU tar and sufficient ownership/xattr/storage privileges. Unsupported/missing metadata and unmapped owners fail safely. Virtual-machine filesystem reconstruction and nested datasets/subvolumes require other qualified strategies/policies.
+3. Staging monitoring can overshoot between samples for external exporters. Use filesystem/project quotas for a strict physical limit, size source LXD pools for publication/application growth, and raise the default staging cap deliberately for large backups. Unknown source capacity is not a verified preflight; strict mode can reject it.
+4. Legacy image publication still retains content-addressed image data to avoid deleting shared/unrelated resources. Budget and review those source images; there is no global image deletion. Failed source snapshots, receivers and archives remain until reviewed. Chain-aware retention protects incomplete chains and may retain extra repository data.
+5. Modern restores keep applications stopped and restore tests use root-only devices, but a remote name/flag cannot prove physical isolation. Supply genuinely separate test infrastructure. External excluded/bind data still needs explicit independent recovery/remapping; managed-volume restoration is automated when supported.
+6. Locks coordinate shared source state, not independent controllers using unrelated state directories. Stable agent identities must be configured before relying on multi-host retention scope. Independent LXD/SSH traffic limits and transport overhead remain outside Restic's upload-byte reporting.
+7. Repository locks are never forcibly removed; repository-wide prune is not automatic. Protect catalog receipts and recover metadata through Restic after local state loss. Unfinished resources remain journaled.
+8. Original redistribution license terms still need clarification before publication. No release publication is authorized here.
+
+## Prepared changes
+
+The original seven commits are unchanged. New local commits:
+
+- `ddac266`: native reconstruction, storage streams/chains, compatibility, capacity/staging safety, metrics, coexistence and regressions.
+- `94620f1`: guarded real LXD 3.0.3/SFTP and kernel-storage harnesses, expected version/backend checks and CI workflow validation.
+- Documentation/configuration report commit: see `git log`.
+
+See [STORAGE_STREAMS.md](STORAGE_STREAMS.md), [COMPATIBILITY.md](COMPATIBILITY.md), [RESTORE.md](RESTORE.md) and the examples for executable procedures. Local binary artifacts coexist with `/usr/local/bin/lxcer`; nothing is installed automatically.

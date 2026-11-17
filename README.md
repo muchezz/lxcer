@@ -2,6 +2,8 @@
 
 Backup, verify and restore LXD containers using LXC and Restic. Originally written by [pavel1337](https://github.com/pavel1337/lxcer); modernization developed in [muchezz/lxcer](https://github.com/muchezz/lxcer). The original Git history and module name are preserved.
 
+New storage-native incrementals and automated native reconstruction are documented in [storage streams](docs/STORAGE_STREAMS.md). These adapters require disposable-host qualification before production use.
+
 The modernization replaces the original duplicated pipelines with locked, durable jobs. Running and stopped containers are selected consistently; failed required uploads produce a nonzero exit and retain recovery artifacts. Required Restic snapshots and tree paths are verified before cleanup. New restore commands create stopped instances and refuse collisions. Original flag-based restores with unversioned configuration retain automatic startup; `-stopped` opts out.
 
 **Compatibility status:** automated command simulations cover LXD 3.0.3, 4.0, 5.0, 5.21, 6.0 and capability-based future behavior. No real LXD server/storage combination has yet been verified in this development environment. Real local Restic 0.16.4 and zstd 1.5.5 are exercised in isolated tests. Read [compatibility](docs/COMPATIBILITY.md) before adoption. This branch needs disposable-host qualification before production rollout.

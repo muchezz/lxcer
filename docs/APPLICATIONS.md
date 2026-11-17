@@ -27,6 +27,7 @@ workers: 2
 inventory:
   - name: legacy-agent
     ssh: legacy-agent
+    agent_binary: /opt/lxcer/lxcer
     remote_config: /etc/lxcer/legacy-agent.yml
 # All jobs use source-side agents; repository credentials live only on agents.
 ```

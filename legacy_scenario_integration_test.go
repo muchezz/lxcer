@@ -38,10 +38,16 @@ func requireRootProfile(ctx context.Context, l LXD, name string) error {
 		return err
 	}
 	var p struct {
+		Config  map[string]string            `json:"config"`
 		Devices map[string]map[string]string `json:"devices"`
 	}
 	if err = json.Unmarshal(b, &p); err != nil {
 		return err
+	}
+	for key := range p.Config {
+		if strings.HasPrefix(key, "raw.") || strings.HasPrefix(key, "security.") {
+			return fmt.Errorf("test profile contains unsafe configuration")
+		}
 	}
 	roots := 0
 	for _, d := range p.Devices {
