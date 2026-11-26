@@ -1,17 +1,10 @@
----
-# backup containers from these remote LXC hosts
-hosts: [ ]
-# ignore containers that a listed here:
-blacklist: [ ]
-# number of workers which do image export and compression
-local_workers: 1
-# as many as you like
-backup_restic_repos:
-  - path: restic_repos/one
-    password: one
-  - path: restic_repos/two
-    password: two
-# only one
-restore_restic_repo:
-  path: restic_repos/one
-  password: one
+version: 1
+state_dir: ./lxcer-state
+workers: 2
+inventory:
+  - name: local
+    workers: 2
+destinations:
+  - name: primary
+    path: ./restic-repo
+    password_env: LXCER_RESTIC_PASSWORD

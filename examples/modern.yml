@@ -1,0 +1,28 @@
+version: 1
+state_dir: /var/lib/lxcer
+workers: 3
+timeout: 2h
+compression: zstd
+# The textfile collector directory must already exist.
+# metrics_file: /var/lib/node_exporter/textfile_collector/lxcer.prom
+
+inventory:
+  - name: local
+    workers: 2
+    instances:
+      database:
+        hooks:
+          pre:
+            - argv: [/usr/local/sbin/lxcer-database-dump]
+              timeout: 20m
+          quiesce:
+            - argv: [/usr/local/sbin/lxcer-quiesce]
+          resume:
+            - argv: [/usr/local/sbin/lxcer-resume]
+  - name: lab # An authenticated LXD remote
+
+destinations:
+  - name: primary
+    path: /srv/restic/lxcer
+    password_env: LXCER_RESTIC_PASSWORD
+    keep_last: 7

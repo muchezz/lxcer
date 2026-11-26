@@ -1,780 +1,445 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
-	"os/exec"
+	"io"
+	"log/slog"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
 	"sync"
-	"time"
-
-	log "github.com/sirupsen/logrus"
+	"syscall"
 )
 
-var (
-	StatusRunning int    = 103
-	sn            string = "ssnet"
-)
+var version = "dev"
+var commit = "unknown"
+var buildDate = "unknown"
 
-func init() {
-	log.SetFormatter(&log.TextFormatter{
-		DisableColors: true,
-	})
-}
-
-func main() {
-	config := loadConfig()
-
-	switch config.ActionType {
-	case "backup":
-		Backup(config)
-		return
-	case "restore":
-		Restore(config)
-		return
+func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
+func run(args []string, out, errOut io.Writer) int {
+	legacyFlags := len(args) > 0 && strings.HasPrefix(args[0], "-")
+	f := flag.NewFlagSet("lxcer", flag.ContinueOnError)
+	f.SetOutput(errOut)
+	sourceID := f.String("source-id", "", "stable identity of a source-side local agent")
+	sourceHost := f.String("source-host", "", "catalog source host filter")
+	legacy := f.Bool("legacy", false, "include pre-modernization repository snapshots in discovery")
+	legacyMetadata := f.String("legacy-metadata", "", "JSON instance metadata for adopting an old archive")
+	artifactPath := f.String("artifact-path", "", "original absolute archive path in a legacy snapshot")
+	action := f.String("a", "", "backup, list, discover, verify, restore-plan, restore, restore-test, cleanup, recover, capabilities, validate, retention, recover-catalog, adopt-legacy, version")
+	config := f.String("config", "conf.yml", "YAML configuration")
+	stopped := f.Bool("stopped", false, "keep a legacy restore stopped instead of starting it")
+	local := f.Bool("local", false, "use local LXD")
+	host := f.String("remote-host", "", "authenticated LXD remote")
+	name := f.String("container", "", "select exactly one instance")
+	as := f.String("as", "", "restore name")
+	concurrent := f.Bool("concurrently", false, "use configured concurrency")
+	restoreList := f.String("restore-list", "", "strict source:target restore list")
+	cleanup := f.Bool("cleanup", false, "obsolete: use cleanup command")
+	manifest := f.String("manifest", "", "job manifest path")
+	dest := f.String("destination", "", "destination name")
+	snapshot := f.String("snapshot", "", "exact Restic snapshot ID")
+	execute := f.Bool("execute", false, "execute cleanup, recovery, or configured scoped retention")
+	pool := f.String("storage-pool", "", "restore pool mapping")
+	networks := f.String("network-map", "", "comma-separated old=new network mappings")
+	isolated := f.Bool("isolated-target", false, "acknowledge dedicated isolated target host")
+	profile := f.String("profile", "", "root-only isolated restore profile")
+	health := f.String("health-argv", "", "optional JSON argv health check inside isolated test instance")
+	target := f.String("target", "", "new catalog recovery directory")
+	restoreVolumes := f.Bool("restore-volumes", false, "restore exported managed volumes under new names")
+	receiveDataset := f.String("receive-dataset", "", "disposable ZFS parent dataset for stream reconstruction")
+	nativeTarget := f.String("native-target", "", "new filesystem restore directory")
+	defaultLevel := "info"
+	if legacyFlags {
+		defaultLevel = "error"
+	}
+	level := f.String("log-level", defaultLevel, "debug, info, warn, error")
+	jsonLog := f.Bool("json-log", !legacyFlags, "structured JSON logging")
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		args = append([]string{"-a", args[0]}, args[1:]...)
+	}
+	if err := f.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if f.NArg() != 0 {
+		fmt.Fprintln(errOut, "unexpected positional arguments")
+		return 2
+	}
+	if *action == "version" {
+		fmt.Fprintf(out, "lxcer %s commit=%s built=%s\n", version, commit, buildDate)
+		return 0
+	}
+	var lv slog.Level
+	switch strings.ToLower(*level) {
+	case "warning":
+		lv = slog.LevelWarn
+	case "trace":
+		lv = slog.LevelDebug
+	case "fatal", "panic":
+		lv = slog.LevelError
 	default:
-		log.Fatalln("Please provide action type with -a flag (backup or restore)")
-	}
-}
-
-func Backup(config *Config) {
-	// Disabled checks before backups as it takes ages
-	// for _, r := range config.BackupResticRepos {
-	// 	r.Check()
-	// }
-
-	if config.Cleanup {
-		cleanupLocal()
-	}
-
-	if config.Local {
-		if *concurrently {
-			localBackupsConcurrently(config)
-			return
-		} else {
-			localBackup(config)
-			return
+		if err := lv.UnmarshalText([]byte(*level)); err != nil {
+			fmt.Fprintln(errOut, "invalid log level")
+			return 2
 		}
 	}
-
-	if *flagContainer != "" && *remoteHost != "" {
-		h := toHost(*remoteHost)
-		h.BackupOne(config, *flagContainer)
-		return
+	opts := &slog.HandlerOptions{Level: lv}
+	var handler slog.Handler
+	if *jsonLog {
+		handler = slog.NewJSONHandler(errOut, opts)
+	} else {
+		handler = slog.NewTextHandler(errOut, opts)
 	}
-
-	var hosts = toHosts(config.Hosts)
-
-	if *remoteHost != "" {
-		h := toHost(*remoteHost)
+	log := slog.New(handler)
+	fail := func(err error) int { log.Error("command failed", "operation", *action, "error", err); return 1 }
+	if *cleanup {
+		return fail(errors.New("-cleanup removed because it deleted unrelated resources; use cleanup preview, then -execute"))
+	}
+	c, err := readConfig(*config)
+	if err != nil {
+		return fail(err)
+	}
+	if *action == "validate" {
+		fmt.Fprintln(out, "configuration valid")
+		return 0
+	}
+	if *sourceID != "" {
+		if !*local || !validName(*sourceID) {
+			return fail(errors.New("-source-id requires -local and a safe identity"))
+		}
+		c.HostID = *sourceID
+	}
+	if !*concurrent {
+		c.Workers = 1
+	}
+	if *host != "" && !validName(*host) {
+		return fail(errors.New("invalid remote name"))
+	}
+	if *name != "" && !validName(*name) {
+		return fail(errors.New("invalid container name"))
+	}
+	hosts := c.Inventory
+	selectedHost := *host
+	if *local {
+		if *host != "" {
+			return fail(errors.New("choose -local or -remote-host"))
+		}
+		selectedHost = "local"
+	}
+	if selectedHost != "" {
+		h := Host{Name: selectedHost, Workers: c.Workers}
+		for _, x := range hosts {
+			if x.Name == selectedHost {
+				h = x
+			}
+		}
+		if *local {
+			h.SSH = ""
+		}
 		hosts = []Host{h}
 	}
-
-	if len(hosts) < 1 {
-		log.Fatal("No hosts in config, nothing to backup")
+	e := Engine{C: c, Log: log}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	ctx, stop := context.WithTimeout(ctx, c.Timeout)
+	defer stop()
+	var m Manifest
+	if *manifest != "" {
+		m, err = loadManifest(*manifest)
+		if err != nil {
+			return fail(err)
+		}
 	}
+	switch *action {
+	case "backup":
+		err = e.backup(ctx, hosts, *name, *concurrent)
+	case "capabilities":
+		for _, h := range hosts {
+			l := LXD{Host: h.Name}
+			if err = l.Detect(ctx); err != nil {
+				break
+			}
+			b, _ := json.Marshal(map[string]any{"host": h.Name, "capabilities": l.Caps})
+			fmt.Fprintln(out, string(b))
+		}
+		if len(hosts) == 0 {
+			err = errors.New("select a host")
+		}
+	case "list":
+		var files []string
+		files, err = manifestPaths(c.StateDir)
+		if err == nil {
+			for _, path := range files {
+				b, er := os.ReadFile(path)
+				if er != nil {
+					err = er
+					break
+				}
+				fmt.Fprintln(out, string(b))
+			}
+		}
+	case "discover":
+		var d Destination
+		d, err = e.destination(*dest)
+		if err == nil {
+			var b []byte
+			args := []string{"snapshots", "--json"}
+			if !*legacy {
+				args = append(args, "--tag", "lxcer-data")
+			}
+			b, err = e.repo(d).run(ctx, args...)
+			if err == nil {
+				fmt.Fprintln(out, string(b))
+			}
+		}
+	case "adopt-legacy":
+		var adopted Manifest
+		adopted, err = e.adoptLegacy(ctx, *dest, *snapshot, *artifactPath, *legacyMetadata, *sourceHost)
+		if err == nil {
+			fmt.Fprintln(out, filepath.Join(c.StateDir, adopted.ID, "manifest.json"))
+		}
+	case "recover-catalog":
+		var d Destination
+		d, err = e.destination(*dest)
+		if err == nil {
+			err = e.recoverCatalog(ctx, d, *snapshot, *target)
+		}
+	case "verify":
+		if *manifest == "" {
+			err = errors.New("-manifest required")
+			break
+		}
+		matched := 0
+		for _, s := range m.Destinations {
+			if *dest != "" && s.Name != *dest {
+				continue
+			}
+			matched++
+			d, er := e.destination(s.Name)
+			if er == nil {
+				r := e.repo(d)
+				er = r.verify(ctx, s.SnapshotID, m.Paths)
+				if er == nil && s.ReceiptID != "" {
+					_, er = r.snapshot(ctx, s.ReceiptID)
+				}
+			}
+			err = errors.Join(err, er)
+		}
+		if matched == 0 {
+			err = errors.New("no destination matched verification request")
+		}
+	case "restore", "restore-plan", "restore-test":
+		if selectedHost == "" {
+			err = errors.New("explicit restore target required")
+			break
+		}
 
-	if *concurrently {
-		remoteBackupsConcurrently(hosts, config)
-		return
-	}
+		ns := map[string]string{}
+		if *networks != "" {
+			for _, pair := range strings.Split(*networks, ",") {
+				a, b, ok := strings.Cut(pair, "=")
+				if !ok || !validName(a) || !validName(b) {
+					err = errors.New("invalid network mapping")
+					break
+				}
+				ns[a] = b
+			}
+		}
+		if err != nil {
+			break
+		}
+		var argv []string
+		if *health != "" {
+			if err = json.Unmarshal([]byte(*health), &argv); err != nil {
+				break
+			}
+		}
+		restoreDestination := *dest
+		if restoreDestination == "" && c.RestoreResticRepo.Path != "" {
+			restoreDestination = "legacy-restore"
+			for i, d := range c.Destinations {
+				if d.Path == c.RestoreResticRepo.Path {
+					restoreDestination = d.Name
+					override := c.RestoreResticRepo
+					override.Name = d.Name
+					e.C.Destinations[i] = override
+					break
+				}
+			}
+		}
+		if restoreDestination == "" && len(c.Destinations) == 1 {
+			restoreDestination = c.Destinations[0].Name
+		}
+		legacyRestore := legacyFlags && c.Legacy
+		o := RestoreOptions{ReceiveDataset: *receiveDataset, Start: legacyRestore && !*stopped, RestoreVolumes: *restoreVolumes, Name: *as, Host: selectedHost, Destination: restoreDestination, Snapshot: *snapshot, Pool: *pool, Networks: ns, DryRun: *action == "restore-plan", Test: *action == "restore-test", Isolated: *isolated, Profile: *profile, Health: argv, NativeTarget: *nativeTarget}
 
-	for _, h := range hosts {
-		h.Backup(config)
-	}
-
-}
-
-func Restore(config *Config) {
-	if !config.Local && *remoteHost == "" {
-		log.Fatalln("Please set -remote-host or -local flag to restore")
-	}
-
-	// Disabled checks before backups as it takes ages
-	// config.RestoreResticRepo.Check()
-
-	if config.Cleanup {
-		cleanupLocal()
-	}
-
-	if *flagContainer != "" && *restoreContainerAs != "" {
-		restoreOne(config, *flagContainer, *restoreContainerAs)
-		return
-	}
-
-	if *restoreList != "" {
-		if *concurrently {
-			restoreConcurrently(config)
-			return
+		pairs := map[string]string{}
+		if *restoreList != "" {
+			pairs, err = loadRestoreList(*restoreList)
+			if err != nil {
+				break
+			}
 		} else {
-			for k, v := range config.ContList {
-				restoreOne(config, k, v)
+			source := *name
+			if source == "" {
+				source = m.Instance.Name
 			}
-			return
-		}
-	}
-
-}
-
-func restoreOne(config *Config, container, restoreAs string) {
-	log := log.WithField("container", container)
-	if config.Local {
-		log = log.WithField("host", "local")
-	} else {
-		log = log.WithField("host", *remoteHost)
-	}
-
-	t := time.Now()
-	err := config.RestoreResticRepo.Restore(container)
-	if err != nil {
-		log.Fatalln(err)
-	}
-	log.WithField("spent", time.Since(t)).Info("Restore .tar.zst from restic")
-
-	t = time.Now()
-	err = DecompressWithZst(container)
-	if err != nil {
-		log.Fatalln(err)
-	}
-	log.WithField("spent", time.Since(t)).Info("Decompress .tar.zst to .tar")
-
-	t = time.Now()
-	err = DeleteImageTarZst(container)
-	if err != nil {
-		log.Fatalln(err)
-	}
-	log.WithField("spent", time.Since(t)).Info("Delete .tar.zst")
-
-	t = time.Now()
-	if config.Local {
-		err = ImportImage(fmt.Sprintf("%s.tar", container), restoreAs)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		log.WithField("spent", time.Since(t)).Info("Import to local LXC image from .tar")
-
-	} else {
-		err = ImportImageRemote(fmt.Sprintf("%s.tar", container), restoreAs, *remoteHost)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		log.WithField("spent", time.Since(t)).Info("Import to remote LXC image from .tar")
-	}
-
-	t = time.Now()
-	err = DeleteImageTar(container)
-	if err != nil {
-		log.Fatalln(err)
-	}
-	log.WithField("spent", time.Since(t)).Info("Delete .tar")
-
-	t = time.Now()
-	if config.Local {
-		err = StartContainerFromImageLocal(restoreAs)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		log.WithField("spent", time.Since(t)).Info("Start local container")
-
-		t = time.Now()
-		err = DeleteImage(restoreAs)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		log.WithField("spent", time.Since(t)).Info("Delete remote image")
-
-	} else {
-		err = StartContainerFromImageRemote(restoreAs, *remoteHost)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		log.WithField("spent", time.Since(t)).Info("Start remote container")
-
-		t = time.Now()
-		err = DeleteImageRemote(restoreAs, *remoteHost)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		log.WithField("spent", time.Since(t)).Info("Delete remote image")
-	}
-
-}
-
-func restoreConcurrently(config *Config) {
-	ch := restoreDecompressImport(config)
-	restoreStart(config, ch)
-}
-
-func restoreDecompressImport(config *Config) chan RestoreContainer {
-	ch := make(chan RestoreContainer)
-	go func() {
-		wg := sync.WaitGroup{}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for container, restoreAs := range config.ContList {
-				log := log.WithField("container", container)
-				if config.Local {
-					log = log.WithField("host", "local")
-				} else {
-					log = log.WithField("host", *remoteHost)
-				}
-
-				t := time.Now()
-				err := config.RestoreResticRepo.Restore(container)
-				if err != nil {
-					log.Errorln(err)
-					continue
-				}
-				log.WithField("spent", time.Since(t)).Info("Restore .tar.zst from restic")
-
-				t = time.Now()
-				err = DecompressWithZst(container)
-				if err != nil {
-					log.Errorln(err)
-					continue
-				}
-				log.WithField("spent", time.Since(t)).Info("Decompress .tar.zst to .tar")
-
-				t = time.Now()
-				err = DeleteImageTarZst(container)
-				if err != nil {
-					log.Errorln(err)
-					continue
-				}
-				log.WithField("spent", time.Since(t)).Info("Delete .tar.zst")
-
-				t = time.Now()
-				if config.Local {
-					err = ImportImage(fmt.Sprintf("%s.tar", container), restoreAs)
-					if err != nil {
-						log.Errorln(err)
-						continue
-					}
-					log.WithField("spent", time.Since(t)).Info("Import to local LXC image from .tar")
-
-				} else {
-					err = ImportImageRemote(fmt.Sprintf("%s.tar", container), restoreAs, *remoteHost)
-					if err != nil {
-						log.Errorln(err)
-						continue
-					}
-					log.WithField("spent", time.Since(t)).Info("Import to remote LXC image from .tar")
-				}
-
-				t = time.Now()
-				err = DeleteImageTar(container)
-				if err != nil {
-					log.Errorln(err)
-					continue
-				}
-				log.WithField("spent", time.Since(t)).Info("Delete .tar")
-				var rc RestoreContainer
-				rc.Name = container
-				rc.RestoreName = restoreAs
-				ch <- rc
+			if source == "" {
+				err = errors.New("restore requires -manifest, -container or -restore-list")
+				break
 			}
-		}()
-		wg.Wait()
-		close(ch)
-
-	}()
-	return ch
-}
-
-func restoreStart(config *Config, ch chan RestoreContainer) {
-	for rc := range ch {
-		var err error
-		log := log.WithField("container", rc.RestoreName)
-		if config.Local {
-			log = log.WithField("host", "local")
-		} else {
-			log = log.WithField("host", *remoteHost)
+			pairs[source] = *as
 		}
 
-		t := time.Now()
-		if config.Local {
-			err = StartContainerFromImageLocal(rc.RestoreName)
-			if err != nil {
-				log.Errorln(err)
-				continue
-			}
-			log.WithField("spent", time.Since(t)).Info("Start local container")
-
-			t = time.Now()
-			err = DeleteImage(rc.RestoreName)
-			if err != nil {
-				log.Errorln(err)
-				continue
-			}
-			log.WithField("spent", time.Since(t)).Info("Delete local image")
-
-		} else {
-			err = StartContainerFromImageRemote(rc.RestoreName, *remoteHost)
-			if err != nil {
-				log.Errorln(err)
-				continue
-			}
-			log.WithField("spent", time.Since(t)).Info("Start remote container")
-
-			t = time.Now()
-			err = DeleteImageRemote(rc.RestoreName, *remoteHost)
-			if err != nil {
-				log.Errorln(err)
-				continue
-			}
-			log.WithField("spent", time.Since(t)).Info("Delete remote image")
-
-		}
-	}
-}
-
-func localBackupsConcurrently(config *Config) {
-	ch := handleSnapshotsLocal(config)
-	ch = handleImages(ch, config.LocalWorkers)
-	ch = handleTars(ch, config.LocalWorkers)
-	for _, r := range config.BackupResticRepos {
-		ch = backupToRepo(ch, r)
-	}
-	deleteTarZst(ch)
-}
-
-func remoteBackupsConcurrently(hh []Host, config *Config) {
-	ch := handleSnapshotsRemote(hh, config)
-	ch = handleImages(ch, config.LocalWorkers)
-	ch = handleTars(ch, config.LocalWorkers)
-	for _, r := range config.BackupResticRepos {
-		ch = backupToRepo(ch, r)
-	}
-	deleteTarZst(ch)
-}
-
-func deleteTarZst(ch chan Container) {
-	for c := range ch {
-		log := log.WithFields(log.Fields{
-			"host":      c.Host,
-			"container": c.Name,
-		})
-		t := time.Now()
-		err := DeleteImageTarZst(c.Name)
-		if err != nil {
-			log.Error(err)
-			continue
-		}
-		log.WithField("spent", time.Since(t)).Infof("Delete %s.tar.zst", c.Name)
-	}
-}
-
-func backupToRepo(ch chan Container, r ResticRepo) chan Container {
-	nextChan := make(chan Container)
-
-	go func(r ResticRepo) {
-		for c := range ch {
-			log := log.WithFields(log.Fields{
-				"host":      c.Host,
-				"container": c.Name,
-			})
-			t := time.Now()
-			err := r.Backup(fmt.Sprintf("%s.tar.zst", c.Name))
-			if err != nil {
-				log.Error(err)
-			}
-			log.WithField("spent", time.Since(t)).Infof("Backup %s.tar.zst to %s", c.Name, r.Path)
-			nextChan <- c
-		}
-		close(nextChan)
-	}(r)
-
-	return nextChan
-}
-
-func handleTars(ch chan Container, w int) chan Container {
-	nextChan := make(chan Container, w)
-
-	go func() {
-		wg := sync.WaitGroup{}
-		for i := 0; i < w; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for c := range ch {
-					log := log.WithFields(log.Fields{
-						"host":      c.Host,
-						"container": c.Name,
-					})
-
-					t := time.Now()
-					err := c.CompressWithZst()
-					if err != nil {
-						log.Error(err)
-						continue
-					}
-					log.WithField("spent", time.Since(t)).Infof("Compress %s.tar to %s.tar.zst", c.Name, c.Name)
-
-					t = time.Now()
-					err = DeleteImageTar(c.Name)
-					if err != nil {
-						log.Error(err)
-						continue
-					}
-					log.WithField("spent", time.Since(t)).Infof("Delete %s.tar", c.Name)
-					nextChan <- c
-				}
-			}()
-		}
-		wg.Wait()
-		close(nextChan)
-	}()
-
-	return nextChan
-}
-
-func handleImages(ch chan Container, w int) chan Container {
-	nextChan := make(chan Container, w)
-
-	go func() {
-		wg := sync.WaitGroup{}
-
-		for i := 0; i < w; i++ {
-			wg.Add(1)
-			go func(ch chan Container) {
-				defer wg.Done()
-				for c := range ch {
-					log := log.WithFields(log.Fields{
-						"host":      c.Host,
-						"container": c.Name,
-					})
-
-					t := time.Now()
-					err := c.ExportImage()
-					if err != nil {
-						log.Error(err)
-						continue
-					}
-					log.WithField("spent", time.Since(t)).Infof("Export image as %s.tar", c.Name)
-
-					t = time.Now()
-					err = DeleteImage(c.Name)
-					if err != nil {
-						log.Error(err)
-						continue
-					}
-					log.WithField("spent", time.Since(t)).Infof("Delete image")
-
-					nextChan <- c
-				}
-			}(ch)
-		}
-
-		wg.Wait()
-		close(nextChan)
-	}()
-
-	return nextChan
-}
-
-func handleSnapshotsRemote(hh []Host, config *Config) chan Container {
-	ch := make(chan Container, len(hh))
-	go func() {
-		wg := sync.WaitGroup{}
-		for _, h := range hh {
-			wg.Add(1)
-			go func(h Host) {
-				defer wg.Done()
-				err := h.GetContainers()
-				if err != nil {
-					log.Error(err)
-				}
-				cc := filterContainers(h.Containers, config.Blacklist)
-				for _, c := range cc {
-					t := time.Now()
-					log := log.WithFields(log.Fields{
-						"host":      c.Host,
-						"container": c.Name,
-					})
-					if c.SnapshotExists(sn) {
-						err := c.DeleteSnapshotRemote(sn, h.Name)
-						if err != nil {
-							log.Error(err)
-							continue
+		var restoreErrors []error
+		var restoreMu sync.Mutex
+		var restoreWG sync.WaitGroup
+		slots := make(chan struct{}, c.Workers)
+		restoreSingle := func(source, to string) error {
+			jobPath := *manifest
+			job := m
+			if jobPath == "" {
+				var lookupErr error
+				job, jobPath, lookupErr = e.findManifest(source, *sourceHost, restoreDestination, *snapshot)
+				if lookupErr != nil {
+					if legacyRestore && *action == "restore" && *sourceHost == "" && errors.Is(lookupErr, errNoCatalog) {
+						if *pool != "" || *networks != "" || *restoreVolumes {
+							return errors.New("legacy archive mappings require explicit metadata adoption")
 						}
-						log.WithField("spent", time.Since(t)).Infof("Delete snapshot")
+						if er := e.restoreLegacy(ctx, source, to, selectedHost, restoreDestination, *snapshot, !*stopped); er != nil {
+							return er
+						}
+						restoreMu.Lock()
+						fmt.Fprintf(out, "legacy restore: %s -> %s:%s\n", source, selectedHost, to)
+						restoreMu.Unlock()
+						return nil
 					}
-
-					t = time.Now()
-					err = c.CreateSnapshotRemote(sn, h.Name)
-					if err != nil {
-						log.Error(err)
-						continue
-					}
-					log.WithField("spent", time.Since(t)).Infof("Create remote snapshot %s", sn)
-
-					t = time.Now()
-					err = c.PublishRemote(sn, h.Name)
-					if err != nil {
-						log.Error(err)
-						continue
-					}
-					log.WithField("spent", time.Since(t)).Infof("Publish remote snapshot %s as image", sn)
-
-					t = time.Now()
-					err = c.DeleteSnapshotRemote(sn, h.Name)
-					if err != nil {
-						log.Error(err)
-						continue
-					}
-					log.WithField("spent", time.Since(t)).Infof("Delete remote snapshot %s", sn)
-					ch <- c
+					return lookupErr
 				}
-			}(h)
+			}
+			if source != job.Instance.Name {
+				return errors.New("restore source does not match manifest")
+			}
+			options := o
+			options.Name = to
+			er := e.restore(ctx, &job, options)
+			if *action == "restore-test" && job.RestoreTest != nil {
+				er = errors.Join(er, e.saveRestoreTest(jobPath, job))
+			}
+			if er != nil {
+				return er
+			}
+			restoreMu.Lock()
+			switch {
+			case options.NativeTarget != "":
+				fmt.Fprintf(out, "%s: %s -> %s\n", *action, source, options.NativeTarget)
+			case options.DryRun || options.Test:
+				fmt.Fprintf(out, "%s: %s -> %s:%s\n", *action, source, selectedHost, to)
+			case options.Start:
+				fmt.Fprintf(out, "%s: %s -> %s:%s (started)\n", *action, source, selectedHost, to)
+			default:
+				fmt.Fprintf(out, "%s: %s -> %s:%s (stopped)\n", *action, source, selectedHost, to)
+			}
+			restoreMu.Unlock()
+			return nil
 		}
-		wg.Wait()
-		close(ch)
-
-	}()
-	return ch
-}
-
-func handleSnapshotsLocal(config *Config) chan Container {
-	ch := make(chan Container, config.LocalWorkers)
-	go func() {
-		cc, err := listContainersLocal()
-		if err != nil {
-			log.Fatal(err)
-		}
-		for _, c := range filterContainers(cc, config.Blacklist) {
-			t := time.Now()
-			log := log.WithFields(log.Fields{
-				"host":      c.Host,
-				"container": c.Name,
-			})
-			if c.SnapshotExists(sn) {
-				err := c.DeleteSnapshot(sn)
-				if err != nil {
-					log.Error(err)
-					continue
+		for source, to := range pairs {
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				restoreMu.Lock()
+				restoreErrors = append(restoreErrors, ctx.Err())
+				restoreMu.Unlock()
+				continue
+			}
+			restoreWG.Add(1)
+			go func(source, to string) {
+				defer restoreWG.Done()
+				defer func() { <-slots }()
+				if er := restoreSingle(source, to); er != nil {
+					restoreMu.Lock()
+					restoreErrors = append(restoreErrors, fmt.Errorf("restore %s as %s: %w", source, to, er))
+					restoreMu.Unlock()
 				}
-				log.WithField("spent", time.Since(t)).Infof("Delete snapshot")
-			}
-
-			t = time.Now()
-			err = c.CreateSnapshotLocal(sn)
-			if err != nil {
-				log.Error(err)
-				continue
-			}
-			log.WithField("spent", time.Since(t)).Infof("Create snapshot %s", sn)
-
-			t = time.Now()
-			err = c.PublishSnapshot(sn)
-			if err != nil {
-				log.Error(err)
-				continue
-			}
-			log.WithField("spent", time.Since(t)).Infof("Publish snapshot as image")
-
-			t = time.Now()
-			err = c.DeleteSnapshot(sn)
-			if err != nil {
-				log.Error(err)
-				continue
-			}
-			log.WithField("spent", time.Since(t)).Infof("Delete snapshot %s", sn)
-
-			ch <- c
+			}(source, to)
 		}
-		close(ch)
-	}()
-	return ch
+		restoreWG.Wait()
+
+		err = errors.Join(restoreErrors...)
+		if *action == "restore-test" {
+			err = errors.Join(err, e.writeMetrics(nil))
+		}
+
+	case "cleanup", "recover":
+		err = e.recoverJobs(ctx, out, *execute)
+		if *execute {
+			err = errors.Join(err, e.writeMetrics(nil))
+		}
+	case "retention":
+		var d Destination
+		d, err = e.destination(*dest)
+		if err == nil {
+			scope := selectedHost
+			if *sourceHost != "" {
+				scope = *sourceHost
+			} else if *local && c.HostID != "" {
+				scope = c.HostID
+			}
+			if !validName(scope) || *name == "" {
+				err = errors.New("retention requires explicit host and container scope")
+			} else {
+				var ids []string
+				ids, err = e.repo(d).chainRetention(ctx, scope, *name, *execute)
+				if err == nil {
+					if len(ids) == 0 {
+						fmt.Fprintln(out, "no snapshots eligible for retention")
+					}
+					for _, id := range ids {
+						if *execute {
+							fmt.Fprintln(out, "forgot snapshot", id)
+						} else {
+							fmt.Fprintln(out, "would forget snapshot", id)
+						}
+					}
+				}
+			}
+		}
+	default:
+		err = errors.New("choose a supported action with -a; see -help")
+	}
+	if err != nil {
+		return fail(err)
+	}
+	return 0
 }
-
-func localBackup(config *Config) {
-	cc, err := listContainersLocal()
-	if err != nil {
-		log.Fatal(err)
-	}
-	for _, c := range filterContainers(cc, config.Blacklist) {
-		log := log.WithFields(log.Fields{
-			"host":      c.Host,
-			"container": c.Name,
-		})
-		t := time.Now()
-
-		if c.SnapshotExists(sn) {
-			err := c.DeleteSnapshot(sn)
-			if err != nil {
-				log.Error(err)
-				continue
-			}
-			log.WithField("spent", time.Since(t)).Infof("Delete snapshot")
-		}
-
-		t = time.Now()
-
-		err = c.CreateSnapshotLocal(sn)
-		if err != nil {
-			log.Error(err)
-			continue
-		}
-		log.WithField("spent", time.Since(t)).Infof("Create snapshot %s", sn)
-
-		t = time.Now()
-		err = c.PublishSnapshot(sn)
-		if err != nil {
-			log.Error(err)
-			continue
-		}
-		log.WithField("spent", time.Since(t)).Infof("Publish snapshot as image")
-
-		t = time.Now()
-		err = c.DeleteSnapshot(sn)
-		if err != nil {
-			log.Error(err)
-			continue
-		}
-		log.WithField("spent", time.Since(t)).Infof("Delete snapshot %s", sn)
-
-		t = time.Now()
-		err = c.ExportImage()
-		if err != nil {
-			log.Error(err)
-			continue
-		}
-		log.WithField("spent", time.Since(t)).Infof("Export image as %s.tar", c.Name)
-
-		t = time.Now()
-		err = DeleteImage(c.Name)
-		if err != nil {
-			log.Error(err)
-			continue
-		}
-		log.WithField("spent", time.Since(t)).Infof("Delete image")
-
-		t = time.Now()
-		err = c.CompressWithZst()
-		if err != nil {
-			log.Error(err)
-			continue
-		}
-		log.WithField("spent", time.Since(t)).Infof("Compress %s.tar to %s.tar.zst", c.Name, c.Name)
-
-		t = time.Now()
-		err = DeleteImageTar(c.Name)
-		if err != nil {
-			log.Error(err)
-			continue
-		}
-		log.WithField("spent", time.Since(t)).Infof("Delete %s.tar", c.Name)
-
-		for _, r := range config.BackupResticRepos {
-			t = time.Now()
-			err := r.Backup(fmt.Sprintf("%s.tar.zst", c.Name))
-			if err != nil {
-				log.Error(err)
-				continue
-			}
-			log.WithField("spent", time.Since(t)).Infof("Backup %s.tar.zst to %s", c.Name, r.Path)
-		}
-
-		t = time.Now()
-		err = DeleteImageTarZst(c.Name)
-		if err != nil {
-			log.Error(err)
-			continue
-		}
-		log.WithField("spent", time.Since(t)).Infof("Delete %s.tar.zst", c.Name)
-
-	}
-
-}
-
-func cleanupLocal() {
-	cc, err := listContainersLocal()
-	if err != nil {
-		log.Fatal(err)
-	}
-	for _, c := range cc {
-		err = c.Delete()
-		if err != nil {
-			log.Error(err)
-			continue
-		}
-		log.Infof("Local container %s deleted", c.Name)
-	}
-
-	images, err := listImagesLocal()
-	if err != nil {
-		log.Fatal(err)
-	}
-	for _, image := range images {
-		err = image.Delete()
-		if err != nil {
-			log.Error(err)
-			continue
-		}
-		log.Infof("Local image %s deleted", image.Fingerprint)
-
-	}
-}
-
-func listContainersLocal() ([]Container, error) {
-	var (
-		cc     []Container
-		Stdout bytes.Buffer
-		Stderr bytes.Buffer
-	)
-
-	cmd := exec.Command("lxc", "list", "--format", "json")
-	cmd.Stdout = &Stdout
-	cmd.Stderr = &Stderr
-	err := cmd.Run()
-	if err != nil {
-		return nil, errors.New(Stderr.String())
-	}
-	err = json.Unmarshal(Stdout.Bytes(), &cc)
+func loadRestoreList(path string) (map[string]string, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	var rcc []Container
-	for _, c := range cc {
-		c.Host = "local"
-		rcc = append(rcc, c)
+	defer f.Close()
+	m := map[string]string{}
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		a, b, ok := strings.Cut(strings.TrimSpace(s.Text()), ":")
+		if !ok || !validName(a) || !validName(b) || m[a] != "" {
+			return nil, errors.New("restore list requires unique source:target lines")
+		}
+		m[a] = b
 	}
-	return rcc, nil
-}
-
-func listImagesLocal() ([]Image, error) {
-	var (
-		images []Image
-		Stdout bytes.Buffer
-		Stderr bytes.Buffer
-	)
-
-	cmd := exec.Command("lxc", "image", "list", "--format", "json")
-	cmd.Stdout = &Stdout
-	cmd.Stderr = &Stderr
-	err := cmd.Run()
-	if err != nil {
-		return nil, errors.New(Stderr.String())
-	}
-	err = json.Unmarshal(Stdout.Bytes(), &images)
-	if err != nil {
+	if err = s.Err(); err != nil {
 		return nil, err
 	}
-	return images, nil
-}
-
-func filterContainers(icc []Container, blacklist []string) []Container {
-	var cc []Container
-	for _, c := range icc {
-		if c.StatusCode != StatusRunning {
-			continue
-		}
-		if contains(blacklist, c.Name) {
-			continue
-		}
-		cc = append(cc, c)
+	if len(m) == 0 {
+		return nil, errors.New("empty restore list")
 	}
-	return cc
+	return m, nil
 }

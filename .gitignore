@@ -1,2 +1,5 @@
-bin/
-dev/
+/lxcer
+/lxcer-state/
+/dist/
+/bin/
+/dev/

@@ -1,8 +1,7 @@
 module github.com/pavel1337/lxcer
 
-go 1.14
+go 1.26.0
 
-require (
-	github.com/sirupsen/logrus v1.7.0
-	gopkg.in/yaml.v2 v2.3.0
-)
+toolchain go1.26.11
+
+require gopkg.in/yaml.v3 v3.0.1

@@ -1,0 +1,37 @@
+name: prepare-release-artifacts
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Approved version identifier (artifacts only; no publication)
+        required: true
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build reproducible Linux artifacts
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          go vet ./...
+          ./scripts/build-release.sh "$RELEASE_VERSION"
+      - uses: actions/upload-artifact@v4
+        if: vars.LXCER_REDISTRIBUTION_APPROVED == 'true'
+        with:
+          name: lxcer-release
+          if-no-files-found: error
+          path: |
+            dist/lxcer-linux-amd64
+            dist/lxcer-linux-arm64
+            dist/SHA256SUMS
+            dist/CHANGELOG.md
+            dist/NOTICE
+            dist/licenses/

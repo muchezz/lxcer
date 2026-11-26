@@ -1,63 +1,111 @@
 # lxcer
-Backup/restore tool for `LXC` containers to `restic` with `zstd` compression.
 
-### Requirements
+A lightweight backup and recovery tool for LXD with multi-remote support, concurrent backups, Restic integration, Zstandard compression, Prometheus metrics and backup verification.
 
-- zstd >= 1.38
-- lxc >= 3.0.3
-- restic >= 0.10.0
+**Current release candidate** `v0.4.0-rc.1` is available for qualification from source. Live LXD backup and restore still need qualification on the target environment. [Maintained repository](https://github.com/muchezz/lxcer) · [Compatibility matrix](docs/COMPATIBILITY.md)
 
-### Description
-This is wrapper for `lxc`, `zstd`, `restic` CLI interfaces. Before running:
-- all listed above programs are installed and in the $PATH
-- configure the `conf.yml` accordingly
-- all hosts that are listed in `conf.yml` are indeed available for lxc cli: `lxc remote list`
-- all restic repos that are listed in `conf.yml` are created and not broken
+## Features
 
-It does simple `restic check` before any work starts and fatals out in case an error.
+- Back up running and stopped LXD instances locally, through authenticated LXD remotes, or with a source-side SSH agent.
+- Limit concurrency globally and per host, optionally compress archives with Zstandard, and write to one or more Restic destinations.
+- Verify uploaded snapshots and retain staging on upload failure. Restore into a new stopped instance and validate recovery on an isolated LXD host.
+- Export backup, recovery, and freshness metrics through the Node Exporter textfile collector.
 
-#### Backup
-Follows logic below:
-1. Create (remote) snapshot
-2. Publish (remote) snapshot as image
-3. Export image as .tar
-4. Compress .tar to .tar.zst
-5. Push .tar.zst to listed restic repos.
+## Install
 
-If run concurrently, then for each remote host starts its own goroutine which creates and publishes snapshots. Then passes image to next goroutine which exports it, then passes to next one which compresses it and passes it further to goroutines that push compressed archives to restic repos.
+Use Linux AMD64 or ARM64, an authenticated `lxc` client, and Restic **0.16.0 or later**. Use Zstandard **1.3.8 or later** for compression, SSH for agent mode, and GNU tar for native filesystem image reconstruction. Building from source requires Go **1.26 or later**.
 
-##### Examples
-1. Backup all containers from all hosts listed in `/etc/lxc/config.yml` concurrently with only errors as output (if any)
+From the repository root:
 
-`lxcer -a backup --config /etc/lxcer/config.yml --concurrently`
-
-2. Backup all containers from host ```host-01``` concurrently with only errors as output (if any)
-
-`lxcer -a backup --remote-host host-01 --config /etc/lxcer/config.yml --concurrently`
-
-3. Backup container ```container-01``` from host ```host-01``` concurrently with only errors as output (if any)
-
-`lxcer -a backup --remote-host host-01 --container contrainer-01 --config /etc/lxcer/config.yml --concurrently`
-
-#### Restore
-Follows logic below:
-1. Download latest snapshot for container
-2. Decompress it from .tar.zst to .tar
-3. Import .tar as (remote) image
-4. Start (remote) container from (remote) image.
-
-##### Examples
-Restore single container with name `app-01` as container `app-02` on remote host with name `rhost-01` with log info printed in terminal.
-
-`lxcer -config conf.yml -a restore -container app-01 --as app-02 -remote-host rhost-01 --log-level info`
-
-Restore a list of containers on remote host `rhost-01` with log info printed in terminal.
-
-`lxcer -config conf.yml -a restore -restore-list restore.lst -remote-host rhost-01 -concurrently`
-
-The restore.lst should be in the format below:
-
+```sh
+go build -trimpath -o ./lxcer .
+install -Dm755 ./lxcer "$HOME/.local/bin/lxcer"
+export PATH="$HOME/.local/bin:$PATH"
+lxcer version
 ```
-container_to_restore:name_of_restored_container
+
+For release candidate builds, checksum verification, and side-by-side upgrades, see [builds and releases](docs/DEVELOPMENT.md).
+
+## Quick start
+
+On a disposable LXD host, start with the example configuration. Initialize the example repository only if it is new:
+
+```sh
+cp conf.yml lxcer.yml
+restic -r ./restic-repo init
 ```
-So the command above will restore the container `container_to_restore` as `name_of_restored_container` on remote host `rhost-01`
+
+Set `LXCER_RESTIC_PASSWORD` in the backup user's environment to the repository password, or configure a protected `password_file` in `lxcer.yml`. Run from the same working directory so the example's relative repository and state paths resolve consistently.
+
+```sh
+lxcer validate -config lxcer.yml
+lxcer capabilities -config lxcer.yml -local
+lxcer backup -config lxcer.yml -local -container example
+```
+
+Replace `example` with the name of a disposable LXD instance.
+
+## Configuration and remote backups
+
+Set `inventory` for source hosts, `workers` for concurrency, `state_dir` for private staging and manifests, and `destinations` for Restic repositories. Destinations can be local paths or Restic backend addresses such as SFTP and object storage. Initialize repositories with Restic and set credentials for the backup account. Keep staging on a disk with enough space for archives and retained failures. [Configuration reference](docs/CONFIGURATION.md) · [Example configuration](examples/modern.yml)
+
+Register direct LXD remotes with the backup user's `lxc` client. For example, use `lab` for a disposable remote. The second command backs up the sources in `inventory` using their configured worker limits:
+
+```sh
+lxcer backup -config lxcer.yml -remote-host lab -container example
+lxcer backup -config lxcer.yml -concurrently
+```
+
+Use SSH agent mode when lxcer needs access to files on the source host. The agent uses its own configuration, credentials, state, and metrics. [Remote configuration](docs/CONFIGURATION.md#host-and-instance-policies) · [Application consistency](docs/APPLICATIONS.md)
+
+## Verify and recover
+
+A successful backup verifies its Restic data snapshots, expected paths, and catalog receipts. Enable `check` for repository structure checks or `read_data` to verify repository pack data. Find the job ID in the backup log or `lxcer list`, then use its manifest:
+
+```sh
+manifest=./lxcer-state/JOB_ID/manifest.json
+lxcer verify -config lxcer.yml -manifest "$manifest"
+lxcer restore-plan -config lxcer.yml -manifest "$manifest" -local -as example-restored
+lxcer restore -config lxcer.yml -manifest "$manifest" -local -as example-restored
+```
+
+Use a free target name. A modern restore leaves the instance stopped. Run `recover` to inspect an interrupted job. If local manifests are lost, use `discover -legacy` to locate a receipt and `recover-catalog` to retrieve its manifest. [Recovery guide](docs/RESTORE.md)
+
+## Monitoring
+
+Set `metrics_file` to a `.prom` path in Node Exporter's textfile directory. Scrape Node Exporter with Prometheus, import the Grafana dashboard, and route alerts through Alertmanager for failed, overdue, missing, or interrupted backups. [Monitoring setup](docs/OPERATIONS.md#monitoring) · [Alert rules](monitoring/alerts.yml) · [Grafana dashboard](monitoring/grafana.json)
+
+## CLI reference
+
+Run `lxcer COMMAND -config FILE`. The default config is `conf.yml`. Commands that select one repository use `-destination NAME` when multiple destinations are configured. `lxcer -help` lists the flags.
+
+| Command | Use |
+|---|---|
+| `version` | Print version, commit, and build date. |
+| `validate` | Check YAML and password file permissions. |
+| `capabilities` | Inspect LXD with `-local` or `-remote-host NAME`. |
+| `backup` | Select a local host, remote, or configured inventory. Use `-container NAME` to limit selection. |
+| `list` | Print local job manifests. |
+| `discover` | List Restic data snapshots. Add `-legacy` to include receipts and older snapshots. |
+| `verify` | Verify the recorded data snapshot and check for the receipt when present. Requires `-manifest FILE`. |
+| `restore-plan` | Check repository and target constraints before importing. |
+| `restore` | Recover from a manifest or catalog entry. Select a target and supply `-as NAME` or a restore list. |
+| `restore-test` | Verify recovery on a separate remote with an isolated profile. |
+| `recover-catalog` | Extract a manifest from `-snapshot ID` into a new `-target DIR`. |
+| `adopt-legacy` | Verify and catalog an older archive with supplied instance metadata. |
+| `recover`, `cleanup` | Preview recovery or cleanup. Add `-execute` to act on eligible jobs. |
+| `retention` | Preview Restic retention for an explicit source and instance. Add `-execute` to forget eligible snapshots. |
+
+## Migration and compatibility
+
+Unversioned configuration and legacy `-a backup` and `-a restore` invocations remain supported, including original `.tar.zst` archives. Legacy restores with unversioned config start the instance unless you pass `-stopped`. Add `version: 1` when ready for modern defaults, and use the `cleanup` command for eligible lxcer jobs. [Migration options](docs/CONFIGURATION.md#legacy-configuration) · [Legacy recovery](docs/RESTORE.md)
+
+**Verified:** the AMD64 CLI on Ubuntu 24.04, local Restic recovery, Zstandard archives, Prometheus textfile metrics, and LXD capability negotiation against disposable endpoints. The ARM64 CLI ran under QEMU. **Expected:** other reviewed Ubuntu and LXD combinations listed in the matrix. Qualify live exports, imports, storage drivers, and the intended Restic backend on disposable infrastructure before relying on this candidate. [Verified, expected, and unsupported combinations](docs/COMPATIBILITY.md)
+
+## Attribution
+
+This project originated as a fork of pavel1337/lxcer. This independently maintained fork focuses on improving backup reliability, recovery safety, observability, portability and operational usability. Credit for the original implementation belongs to its original author and contributors.
+
+[Original lxcer repository](https://github.com/pavel1337/lxcer)
+
+No upstream project license grant has been identified. Obtain authorization from the upstream rights holders before redistributing the source or binaries. [Project and dependency notices](NOTICE) · [Redistribution details](docs/DEVELOPMENT.md#redistribution)
