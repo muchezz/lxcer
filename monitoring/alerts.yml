@@ -1,21 +1,56 @@
 groups:
   - name: lxcer
     rules:
+      - alert: LxcerExporterDown
+        expr: up{job="lxcer-node"} == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: 'Node Exporter for an lxcer scheduler is unreachable'}
+      - alert: LxcerTextfileReadFailed
+        expr: node_textfile_scrape_error{job="lxcer-node"} == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: 'Node Exporter could not read a textfile'}
       - alert: LxcerBackupsMissing
-        expr: absent(lxcer_backup_last_success_timestamp_seconds)
+        expr: (up{job="lxcer-node"} == 1) unless on (job, instance) lxcer_backup_run_last_completion_timestamp_seconds
         for: 1h
         labels: {severity: critical}
-        annotations: {summary: 'No lxcer backup metrics available'}
+        annotations: {summary: 'No completed lxcer invocation reported by this scheduler'}
+      - alert: LxcerExpectedBackupMissing
+        expr: |
+          (lxcer_backup_expected{job="lxcer-node"} == 1)
+          unless on (job, instance, host, exported_instance)
+          (lxcer_backup_last_success_timestamp_seconds > 0)
+        for: 1h
+        labels: {severity: critical}
+        annotations: {summary: 'Expected LXD instance has no recorded successful backup'}
+      - alert: LxcerBackupRunFailed
+        expr: lxcer_backup_run_success == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations: {summary: 'Latest completed lxcer invocation failed'}
+      - alert: LxcerBackupRunOverdue
+        expr: time() - lxcer_backup_run_last_completion_timestamp_seconds > 93600
+        for: 15m
+        labels: {severity: critical}
+        annotations: {summary: 'No lxcer invocation completed within 26 hours'}
       - alert: LxcerBackupFailed
         expr: lxcer_backup_success == 0
         for: 5m
         labels: {severity: critical}
-        annotations: {summary: 'Latest lxcer job failed'}
+        annotations: {summary: 'Latest completed backup for this instance failed'}
       - alert: LxcerBackupStale
-        expr: time() - lxcer_backup_last_success_timestamp_seconds > 93600
+        expr: |
+          (lxcer_backup_last_success_timestamp_seconds > 0)
+          and (time() - lxcer_backup_last_success_timestamp_seconds > 93600)
         for: 15m
         labels: {severity: critical}
-        annotations: {summary: 'No verified backup within 26 hours'}
+        annotations: {summary: 'No successful backup for this instance within 26 hours'}
+      - alert: LxcerBackupInterrupted
+        expr: lxcer_backup_jobs_interrupted > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: 'Interrupted lxcer job requires recovery or inspection'}
       - alert: LxcerVerificationFailed
         expr: increase(lxcer_backup_verification_failures_total[1h]) > 0
         labels: {severity: critical}

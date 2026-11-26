@@ -1,16 +1,10 @@
-# Legacy hosts/blacklist/local_workers/backup_restic_repos keys remain accepted.
 version: 1
-hosts: []
-blacklist: []
-workers: 1
 state_dir: ./lxcer-state
-timeout: 1h
-compression: none
-min_free_bytes: 1073741824
-policy:
-  strategy: auto
+workers: 2
+inventory:
+  - name: local
+    workers: 2
 destinations:
   - name: primary
-    path: ./restic_repos/one
+    path: ./restic-repo
     password_env: LXCER_RESTIC_PASSWORD
-    keep_last: 7

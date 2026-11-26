@@ -14,9 +14,49 @@ There is no repository-wide prune or automatic unlock. `retention` requires an e
 
 ## Monitoring
 
-Set `metrics_file` to an existing node_exporter textfile collector directory. Metrics are rebuilt at job start/completion and recovery command completion from retained manifests. An interrupted process cannot update its own gauge; run recovery and alert on stale metrics. `lxcer_backup_jobs_running` counts unfinished manifests in the latest atomic metrics refresh; it is not a continuously sampled HTTP endpoint. Host, instance and configured destination are the only label dimensions; job IDs and snapshot IDs are excluded to bound cardinality by inventory size. Keep historical manifests to preserve failure counters/last-success values. External catalog deletion resets those reconstructed counters.
+Use a persistent private `state_dir` and configure one scheduled writer per `metrics_file`. Have concurrently running lxcer commands that share a file also share the same state directory. Writes use a shared lock, a temporary file and an atomic rename. The backup account needs write access to the collector directory. Node Exporter needs read and traverse access, and reads the resulting 0644 file. Keep separate files on separate scrape targets, or use a single state and file per node so metric label sets stay unique. Collect source-side metrics from SSH agents on their own scrape targets. The controller exports its aggregate command result.
 
-[Alert rules](../monitoring/alerts.yml) include failed/missing/stale backups, verification and repeated failures, restore failures and excessive duration. Add an expected-inventory series for per-instance absence alerts and node_exporter textfile staleness alarms. A global absence alert cannot enumerate instances never seen before. Import the [Grafana dashboard](../monitoring/grafana.json) and choose your Prometheus datasource. Configure the systemd service to surface nonzero exits to your alert transport. New subcommands default to JSON logs at info; original flag-based invocation defaults remain text/error. `-log-level` and `-json-log=false` select verbosity/format. Logs identify job, host, instance, operation and failures without repository secrets.
+Set `metrics_file: /var/lib/node_exporter/textfile_collector/lxcer.prom` in lxcer and run Node Exporter with `--collector.textfile.directory=/var/lib/node_exporter/textfile_collector`. No metrics daemon or Pushgateway is required. [Node Exporter textfile collector](https://github.com/prometheus/node_exporter#textfile-collector)
+
+### What to alert on
+
+- **Failed command:** `lxcer_backup_run_success == 0` covers a completed backup invocation, including failures before instance discovery, configuration prerequisites checked by the backup command, and SSH agent failures. Config parsing or a failure to write the metrics file may leave only the service exit status and stale metrics.
+- **Failed instance backup:** `lxcer_backup_success == 0` uses the newest completed attempt. Active work leaves the last result available. An attempt counts as successful after all required data and catalog receipts are verified and the job finishes without errors. The separate `lxcer_backup_required_destinations_verified` metric can show that a failed attempt still has recoverable required copies.
+- **Overdue:** `time() - lxcer_backup_last_success_timestamp_seconds` measures age since the last successful backup finished. Failed, interrupted and running jobs preserve that timestamp. A zero value means the instance has completed an attempt but has no recorded success. The command completion timestamp also detects a stopped schedule, even when instance metrics are still being served from disk.
+- **Missing:** keep a scrape target for each scheduled writer. For per-instance coverage, place an inventory file such as `lxcer_expected.prom` in the same collector directory, with a line such as `lxcer_backup_expected{host="lab",instance="database"} 1` for each expected instance. Update it when retiring or adding an instance. A missing expected instance or a zero last-success timestamp means there is no recorded successful backup.
+- **Interrupted:** the running and interrupted gauges use job locks when rebuilding the textfile. After a process is killed the file remains unchanged until another update, such as `recover -execute`. Alert on command completion age and monitor scheduler exits as well.
+- **Space and verification:** duration and staging peak describe the latest completed attempt. Artifact bytes sum the main artifact, split image parts and managed-volume archives when present. Files streamed directly from the source have no staged artifact size. Upload values are Restic's packed bytes per destination. Verification failures and job failures are counters reconstructed from local history. Deleting that history removes its metrics and can reset counters or freshness.
+
+Metrics label instance series by source host and LXD instance, with destination aliases on upload samples. The command metrics are per scrape target. Repository URLs, paths, credentials and job IDs are excluded. Prometheus's default scrape labeling renames the instance label from the file to `exported_instance`; `instance` identifies the Node Exporter endpoint. [Prometheus scrape configuration](https://prometheus.io/docs/prometheus/latest/configuration/configuration/)
+
+### Prometheus, Grafana and Alertmanager
+
+Load [alerts.yml](../monitoring/alerts.yml) as a rule file and use a dedicated scrape job for Node Exporters that run lxcer. Merge these settings into your existing Prometheus configuration:
+
+```yaml
+rule_files:
+  - /etc/prometheus/rules/lxcer.yml
+scrape_configs:
+  - job_name: lxcer-node
+    static_configs:
+      - targets: [backup-host.example:9100]
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: [alertmanager.example:9093]
+```
+
+Adjust the 26-hour thresholds for your backup schedule. Use Alertmanager's existing route or match the `Lxcer` alert names and `severity` labels to route critical alerts to your paging receiver and warnings to your operations receiver. Group by `alertname`, `job`, and `instance`. In Grafana, import [grafana.json](../monitoring/grafana.json) and select the Prometheus data source. Use `host` and `exported_instance` to filter LXD instances. [Prometheus alert rules](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/) · [Alertmanager routing](https://prometheus.io/docs/alerting/latest/configuration/#route)
+
+The qualification checked the rule syntax with the Prometheus versions shipped by Ubuntu 18.04 through 26.04. It also checked a real Node Exporter 1.7.0 scrape. Use Prometheus 2.45.3 or a newer promtool for the metrics validation command below. See the [compatibility matrix](COMPATIBILITY.md).
+
+Validate before loading the rules:
+
+```sh
+promtool check metrics < /var/lib/node_exporter/textfile_collector/lxcer.prom
+promtool check rules monitoring/alerts.yml
+promtool check config /etc/prometheus/prometheus.yml
+```
 
 ## Performance
 

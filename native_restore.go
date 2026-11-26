@@ -157,7 +157,7 @@ func (e Engine) nativeImage(ctx context.Context, root, dir string, m Manifest) (
 	}
 	image := filepath.Join(dir, "native-image.tar")
 	// Transform member/hardlink names, leaving symlink targets untouched. GNU tar preserves sparse files/ACLs/xattrs.
-	_, err = e.R.Run(ctx, nil, nil, "tar", "--create", "--file", image, "--numeric-owner", "--sparse", "--acls", "--xattrs", "--xattrs-include=*", "--owner-map="+owner, "--group-map="+group, "--transform=flags=rh;s,^\\./,rootfs/,;s,^\\.$,rootfs,", "-C", dir, "metadata.yaml", "-C", root, ".")
+	_, err = runCommand(ctx, "tar", "--create", "--file", image, "--numeric-owner", "--sparse", "--acls", "--xattrs", "--xattrs-include=*", "--owner-map="+owner, "--group-map="+group, "--transform=flags=rh;s,^\\./,rootfs/,;s,^\\.$,rootfs,", "-C", dir, "metadata.yaml", "-C", root, ".")
 	return image, err
 }
 func (e Engine) reconstructNative(ctx context.Context, r Repository, id, staging string, m Manifest, opt RestoreOptions) (string, func() error, error) {
@@ -191,10 +191,6 @@ func (e Engine) receiveStream(ctx context.Context, r Repository, currentID, stag
 	if err := validateStream(m); err != nil {
 		return "", none, err
 	}
-	sr, ok := e.R.(StreamingRunner)
-	if !ok {
-		return "", none, errors.New("runner cannot receive filesystem streams")
-	}
 	entries := append(append([]StreamEntry{}, m.Stream.Parents...), streamEntry(m))
 	entries[len(entries)-1].Repositories = map[string]string{r.D.Name: currentID}
 	received := filepath.Join(staging, "received")
@@ -210,14 +206,14 @@ func (e Engine) receiveStream(ctx context.Context, r Repository, currentID, stag
 		cc, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		if m.Stream.Driver == "zfs" {
-			b, err := e.R.Run(cc, nil, nil, "zfs", "get", "-H", "-o", "value", "org.lxcer:restore", dataset)
+			b, err := runCommand(cc, "zfs", "get", "-H", "-o", "value", "org.lxcer:restore", dataset)
 			if err != nil {
 				return err
 			}
 			if strings.TrimSpace(string(b)) != filepath.Base(staging) {
 				return errors.New("receive dataset ownership mismatch")
 			}
-			_, err = e.R.Run(cc, nil, nil, "zfs", "destroy", "-r", dataset)
+			_, err = runCommand(cc, "zfs", "destroy", "-r", dataset)
 			return err
 		}
 		for i := len(entries) - 1; i >= 0; i-- {
@@ -225,7 +221,7 @@ func (e Engine) receiveStream(ctx context.Context, r Repository, currentID, stag
 			if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			if _, err := e.R.Run(cc, nil, nil, "btrfs", "subvolume", "delete", path); err != nil {
+			if _, err := runCommand(cc, "btrfs", "subvolume", "delete", path); err != nil {
 				return err
 			}
 		}
@@ -236,7 +232,7 @@ func (e Engine) receiveStream(ctx context.Context, r Repository, currentID, stag
 			return "", none, errors.New("ZFS restore requires -receive-dataset pointing at a disposable parent dataset")
 		}
 		dataset = opt.ReceiveDataset + "/" + filepath.Base(staging)
-		if _, err := e.R.Run(ctx, nil, nil, "zfs", "list", "-H", dataset); err == nil {
+		if _, err := runCommand(ctx, "zfs", "list", "-H", dataset); err == nil {
 			return "", none, errors.New("receive dataset collision")
 		}
 	}
@@ -248,11 +244,11 @@ func (e Engine) receiveStream(ctx context.Context, r Repository, currentID, stag
 		if err := r.verify(ctx, id, []string{entry.Artifact}); err != nil {
 			return "", cleanup, err
 		}
-		if _, err := r.run(ctx, "restore", id, "--target", staging, "--include", entry.Artifact, "--verify"); err != nil {
+		if err := r.restorePath(ctx, id, staging, entry.Artifact); err != nil {
 			return "", cleanup, err
 		}
 		path := filepath.Join(staging, strings.TrimPrefix(filepath.Clean(entry.Artifact), "/"))
-		sum, _, err := checksum(path)
+		sum, _, err := checksum(ctx, path)
 		if err != nil {
 			return "", cleanup, err
 		}
@@ -260,7 +256,7 @@ func (e Engine) receiveStream(ctx context.Context, r Repository, currentID, stag
 			return "", cleanup, errors.New("chain stream checksum mismatch")
 		}
 		if strings.HasSuffix(path, ".zst") {
-			if _, err = e.R.Run(ctx, nil, nil, "zstd", "-d", "-T1", path, "-o", path+".raw"); err != nil {
+			if _, err = runCommand(ctx, "zstd", "-d", "-T1", path, "-o", path+".raw"); err != nil {
 				return "", cleanup, err
 			}
 			path += ".raw"
@@ -270,7 +266,7 @@ func (e Engine) receiveStream(ctx context.Context, r Repository, currentID, stag
 			return "", cleanup, err
 		}
 		if m.Stream.Driver == "btrfs" {
-			err = sr.RunStream(ctx, nil, f, nil, "btrfs", "receive", "-e", received)
+			err = runStream(ctx, nil, f, nil, "btrfs", "receive", "-e", received)
 			created = true
 		} else {
 			args := []string{"receive", "-u"}
@@ -278,7 +274,7 @@ func (e Engine) receiveStream(ctx context.Context, r Repository, currentID, stag
 				args = append(args, "-o", "mountpoint="+received, "-o", "canmount=noauto", "-o", "readonly=on", "-o", "org.lxcer:restore="+filepath.Base(staging))
 			}
 			args = append(args, dataset)
-			err = sr.RunStream(ctx, nil, f, nil, "zfs", args...)
+			err = runStream(ctx, nil, f, nil, "zfs", args...)
 			if err == nil {
 				created = true
 			}
@@ -291,15 +287,15 @@ func (e Engine) receiveStream(ctx context.Context, r Repository, currentID, stag
 	root := ""
 	if m.Stream.Driver == "btrfs" {
 		last := filepath.Join(received, m.ID)
-		if _, err := e.R.Run(ctx, nil, nil, "btrfs", "property", "set", "-ts", last, "ro", "false"); err != nil {
+		if _, err := runCommand(ctx, "btrfs", "property", "set", "-ts", last, "ro", "false"); err != nil {
 			return "", cleanup, err
 		}
 		root = filepath.Join(last, m.Stream.RootRelative)
 	} else {
-		if _, err := e.R.Run(ctx, nil, nil, "zfs", "set", "readonly=off", dataset); err != nil {
+		if _, err := runCommand(ctx, "zfs", "set", "readonly=off", dataset); err != nil {
 			return "", cleanup, err
 		}
-		if _, err := e.R.Run(ctx, nil, nil, "zfs", "mount", dataset); err != nil {
+		if _, err := runCommand(ctx, "zfs", "mount", dataset); err != nil {
 			return "", cleanup, err
 		}
 		root = filepath.Join(received, m.Stream.RootRelative)

@@ -4,8 +4,12 @@ After=network-online.target
 Wants=network-online.target
 [Service]
 Type=oneshot
-ExecStart=/opt/lxcer/lxcer -config /etc/lxcer/config.yml -a backup -concurrently
+User=lxcer
+StateDirectory=lxcer
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/lxcer
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+ExecStart=/opt/lxcer/lxcer backup -config /etc/lxcer/config.yml -concurrently
 UMask=0077
-NoNewPrivileges=yes
 PrivateTmp=yes
 TimeoutStartSec=4h

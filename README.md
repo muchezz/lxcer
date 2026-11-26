@@ -1,56 +1,111 @@
 # lxcer
 
-Backup, verify and restore LXD containers using LXC and Restic. Originally written by [pavel1337](https://github.com/pavel1337/lxcer); modernization developed in [muchezz/lxcer](https://github.com/muchezz/lxcer). The original Git history and module name are preserved.
+A lightweight backup and recovery tool for LXD with multi-remote support, concurrent backups, Restic integration, Zstandard compression, Prometheus metrics and backup verification.
 
-New storage-native incrementals and automated native reconstruction are documented in [storage streams](docs/STORAGE_STREAMS.md). These adapters require disposable-host qualification before production use.
+**Current release candidate** `v0.4.0-rc.1` is available for qualification from source. Live LXD backup and restore still need qualification on the target environment. [Maintained repository](https://github.com/muchezz/lxcer) · [Compatibility matrix](docs/COMPATIBILITY.md)
 
-The modernization replaces the original duplicated pipelines with locked, durable jobs. Running and stopped containers are selected consistently; failed required uploads produce a nonzero exit and retain recovery artifacts. Required Restic snapshots and tree paths are verified before cleanup. New restore commands create stopped instances and refuse collisions. Original flag-based restores with unversioned configuration retain automatic startup; `-stopped` opts out.
+## Features
 
-**Compatibility status:** automated command simulations cover LXD 3.0.3, 4.0, 5.0, 5.21, 6.0 and capability-based future behavior. No real LXD server/storage combination has yet been verified in this development environment. Real local Restic 0.16.4 and zstd 1.5.5 are exercised in isolated tests. Read [compatibility](docs/COMPATIBILITY.md) before adoption. This branch needs disposable-host qualification before production rollout.
+- Back up running and stopped LXD instances locally, through authenticated LXD remotes, or with a source-side SSH agent.
+- Limit concurrency globally and per host, optionally compress archives with Zstandard, and write to one or more Restic destinations.
+- Verify uploaded snapshots and retain staging on upload failure. Restore into a new stopped instance and validate recovery on an isolated LXD host.
+- Export backup, recovery, and freshness metrics through the Node Exporter textfile collector.
 
-## Build and install
+## Install
 
-Linux, Go 1.26 or later, authenticated `lxc`, Restic 0.16 or later, and optionally zstd 1.5 or later. Earlier Restic releases used by the original tool require upgrading for verified restores. No privileged daemon is installed.
+Use Linux AMD64 or ARM64, an authenticated `lxc` client, and Restic **0.16.0 or later**. Use Zstandard **1.3.8 or later** for compression, SSH for agent mode, and GNU tar for native filesystem image reconstruction. Building from source requires Go **1.26 or later**.
+
+From the repository root:
 
 ```sh
-go test ./...
 go build -trimpath -o ./lxcer .
-./lxcer version
-./lxcer validate -config conf.yml
+install -Dm755 ./lxcer "$HOME/.local/bin/lxcer"
+export PATH="$HOME/.local/bin:$PATH"
+lxcer version
 ```
 
-Build and test the local binary before installing a separately versioned copy under `/opt/lxcer`. This work does not replace `/usr/local/bin/lxcer`. Initialize repositories separately with Restic; lxcer never initializes or prunes production repositories automatically.
+For release candidate builds, checksum verification, and side-by-side upgrades, see [builds and releases](docs/DEVELOPMENT.md).
 
-## Usage
+## Quick start
+
+On a disposable LXD host, start with the example configuration. Initialize the example repository only if it is new:
 
 ```sh
-# Credentials come from an environment variable, or a protected password_file.
-export LXCER_RESTIC_PASSWORD='your-repository-password'
-./lxcer backup -config conf.yml -local -container stopped-staging
-./lxcer backup -config conf.yml -concurrently
-./lxcer capabilities -config conf.yml -remote-host legacy
-./lxcer list -config conf.yml
-./lxcer discover -config conf.yml -destination primary
-./lxcer verify -config conf.yml -manifest /private/state/lxcer-ID/manifest.json
-./lxcer restore-plan -config conf.yml -container app -as app-dr -remote-host lab -destination primary
-./lxcer restore -config conf.yml -container app -as app-dr -remote-host lab -destination primary
-./lxcer cleanup -config conf.yml                  # preview only
-./lxcer recover -config conf.yml -execute         # resume interrupted hooks, retain failed artifacts
+cp conf.yml lxcer.yml
+restic -r ./restic-repo init
 ```
 
-Unversioned configurations retain the snapshot/image/zstd pipeline and `<instance>.tar.zst` archive names. `restore_restic_repo` still selects the restore repository; old flag-based restores can discover original archives without a manifest or manual adoption. Modern versioned configuration enables the new strategy defaults.
+Set `LXCER_RESTIC_PASSWORD` in the backup user's environment to the repository password, or configure a protected `password_file` in `lxcer.yml`. Run from the same working directory so the example's relative repository and state paths resolve consistently.
 
-`-a backup`, `-config`, `-local`, `-container`, `-remote-host`, `-concurrently`, `-restore-list` and `-as` remain available. `-cleanup` is rejected because its original implementation deleted unrelated resources. All command failures return 1; malformed CLI arguments return 2. Partial success returns 1 with `PartiallyCompleted` in the manifest.
+```sh
+lxcer validate -config lxcer.yml
+lxcer capabilities -config lxcer.yml -local
+lxcer backup -config lxcer.yml -local -container example
+```
 
-## Operations documentation
+Replace `example` with the name of a disposable LXD instance.
 
-- [Architecture and baseline audit](docs/ARCHITECTURE.md), [baseline](docs/BASELINE.md)
-- [Configuration, migration, strategies and multi-host operation](docs/CONFIGURATION.md)
-- [LXD and storage compatibility](docs/COMPATIBILITY.md)
-- [Restoration and disaster recovery](docs/RESTORE.md)
-- [Application consistency and legacy GitLab example](docs/APPLICATIONS.md)
-- [Security, monitoring, troubleshooting and performance](docs/OPERATIONS.md)
-- [Testing, releases and upstream contribution](docs/DEVELOPMENT.md)
-- [Validation report](docs/VALIDATION.md)
+## Configuration and remote backups
 
-No license file was present in the original repository. Preserve attribution; obtain the author's explicit license terms before redistributing releases. Local development is unaffected.
+Set `inventory` for source hosts, `workers` for concurrency, `state_dir` for private staging and manifests, and `destinations` for Restic repositories. Destinations can be local paths or Restic backend addresses such as SFTP and object storage. Initialize repositories with Restic and set credentials for the backup account. Keep staging on a disk with enough space for archives and retained failures. [Configuration reference](docs/CONFIGURATION.md) · [Example configuration](examples/modern.yml)
+
+Register direct LXD remotes with the backup user's `lxc` client. For example, use `lab` for a disposable remote. The second command backs up the sources in `inventory` using their configured worker limits:
+
+```sh
+lxcer backup -config lxcer.yml -remote-host lab -container example
+lxcer backup -config lxcer.yml -concurrently
+```
+
+Use SSH agent mode when lxcer needs access to files on the source host. The agent uses its own configuration, credentials, state, and metrics. [Remote configuration](docs/CONFIGURATION.md#host-and-instance-policies) · [Application consistency](docs/APPLICATIONS.md)
+
+## Verify and recover
+
+A successful backup verifies its Restic data snapshots, expected paths, and catalog receipts. Enable `check` for repository structure checks or `read_data` to verify repository pack data. Find the job ID in the backup log or `lxcer list`, then use its manifest:
+
+```sh
+manifest=./lxcer-state/JOB_ID/manifest.json
+lxcer verify -config lxcer.yml -manifest "$manifest"
+lxcer restore-plan -config lxcer.yml -manifest "$manifest" -local -as example-restored
+lxcer restore -config lxcer.yml -manifest "$manifest" -local -as example-restored
+```
+
+Use a free target name. A modern restore leaves the instance stopped. Run `recover` to inspect an interrupted job. If local manifests are lost, use `discover -legacy` to locate a receipt and `recover-catalog` to retrieve its manifest. [Recovery guide](docs/RESTORE.md)
+
+## Monitoring
+
+Set `metrics_file` to a `.prom` path in Node Exporter's textfile directory. Scrape Node Exporter with Prometheus, import the Grafana dashboard, and route alerts through Alertmanager for failed, overdue, missing, or interrupted backups. [Monitoring setup](docs/OPERATIONS.md#monitoring) · [Alert rules](monitoring/alerts.yml) · [Grafana dashboard](monitoring/grafana.json)
+
+## CLI reference
+
+Run `lxcer COMMAND -config FILE`. The default config is `conf.yml`. Commands that select one repository use `-destination NAME` when multiple destinations are configured. `lxcer -help` lists the flags.
+
+| Command | Use |
+|---|---|
+| `version` | Print version, commit, and build date. |
+| `validate` | Check YAML and password file permissions. |
+| `capabilities` | Inspect LXD with `-local` or `-remote-host NAME`. |
+| `backup` | Select a local host, remote, or configured inventory. Use `-container NAME` to limit selection. |
+| `list` | Print local job manifests. |
+| `discover` | List Restic data snapshots. Add `-legacy` to include receipts and older snapshots. |
+| `verify` | Verify the recorded data snapshot and check for the receipt when present. Requires `-manifest FILE`. |
+| `restore-plan` | Check repository and target constraints before importing. |
+| `restore` | Recover from a manifest or catalog entry. Select a target and supply `-as NAME` or a restore list. |
+| `restore-test` | Verify recovery on a separate remote with an isolated profile. |
+| `recover-catalog` | Extract a manifest from `-snapshot ID` into a new `-target DIR`. |
+| `adopt-legacy` | Verify and catalog an older archive with supplied instance metadata. |
+| `recover`, `cleanup` | Preview recovery or cleanup. Add `-execute` to act on eligible jobs. |
+| `retention` | Preview Restic retention for an explicit source and instance. Add `-execute` to forget eligible snapshots. |
+
+## Migration and compatibility
+
+Unversioned configuration and legacy `-a backup` and `-a restore` invocations remain supported, including original `.tar.zst` archives. Legacy restores with unversioned config start the instance unless you pass `-stopped`. Add `version: 1` when ready for modern defaults, and use the `cleanup` command for eligible lxcer jobs. [Migration options](docs/CONFIGURATION.md#legacy-configuration) · [Legacy recovery](docs/RESTORE.md)
+
+**Verified:** the AMD64 CLI on Ubuntu 24.04, local Restic recovery, Zstandard archives, Prometheus textfile metrics, and LXD capability negotiation against disposable endpoints. The ARM64 CLI ran under QEMU. **Expected:** other reviewed Ubuntu and LXD combinations listed in the matrix. Qualify live exports, imports, storage drivers, and the intended Restic backend on disposable infrastructure before relying on this candidate. [Verified, expected, and unsupported combinations](docs/COMPATIBILITY.md)
+
+## Attribution
+
+This project originated as a fork of pavel1337/lxcer. This independently maintained fork focuses on improving backup reliability, recovery safety, observability, portability and operational usability. Credit for the original implementation belongs to its original author and contributors.
+
+[Original lxcer repository](https://github.com/pavel1337/lxcer)
+
+No upstream project license grant has been identified. Obtain authorization from the upstream rights holders before redistributing the source or binaries. [Project and dependency notices](NOTICE) · [Redistribution details](docs/DEVELOPMENT.md#redistribution)

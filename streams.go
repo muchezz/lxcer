@@ -74,10 +74,10 @@ func (e Engine) streamRoot(ctx context.Context, p Policy, driver string) (string
 		if real != filepath.Clean(source) {
 			return "", errors.New("storage_source must be canonical")
 		}
-		if _, err = e.R.Run(ctx, nil, nil, "btrfs", "subvolume", "show", source); err != nil {
+		if _, err = runCommand(ctx, "btrfs", "subvolume", "show", source); err != nil {
 			return "", err
 		}
-		b, err := e.R.Run(ctx, nil, nil, "btrfs", "subvolume", "list", "-o", source)
+		b, err := runCommand(ctx, "btrfs", "subvolume", "list", "-o", source)
 		if err != nil {
 			return "", err
 		}
@@ -89,14 +89,14 @@ func (e Engine) streamRoot(ctx context.Context, p Policy, driver string) (string
 		if !datasetPattern.MatchString(source) {
 			return "", errors.New("invalid ZFS dataset")
 		}
-		b, err := e.R.Run(ctx, nil, nil, "zfs", "get", "-H", "-o", "value", "mountpoint", source)
+		b, err := runCommand(ctx, "zfs", "get", "-H", "-o", "value", "mountpoint", source)
 		if err != nil {
 			return "", err
 		}
 		mount := strings.TrimSpace(string(b))
 		if !filepath.IsAbs(mount) {
 			// LXD commonly uses mountpoint=legacy and mounts the dataset itself.
-			mounts, er := e.R.Run(ctx, nil, nil, "findmnt", "--json", "--source", source, "--output", "TARGET,FSROOT")
+			mounts, er := runCommand(ctx, "findmnt", "--json", "--source", source, "--output", "TARGET,FSROOT")
 			if er != nil {
 				return "", errors.New("zfs source is not mounted; configure a mounted source or explicit full fallback")
 			}
@@ -121,7 +121,7 @@ func (e Engine) streamRoot(ctx context.Context, p Policy, driver string) (string
 				return "", errors.New("zfs source has no mounted dataset root covering native_root")
 			}
 		}
-		b, err = e.R.Run(ctx, nil, nil, "zfs", "list", "-H", "-o", "name", "-r", source)
+		b, err = runCommand(ctx, "zfs", "list", "-H", "-o", "name", "-r", source)
 		if err != nil {
 			return "", err
 		}
@@ -138,9 +138,6 @@ func (e Engine) streamPreflight(ctx context.Context, l LXD, c Container, p Polic
 	}
 	if c.Type == "virtual-machine" {
 		return errors.New("filesystem streams do not reconstruct virtual machines")
-	}
-	if _, ok := e.R.(StreamingRunner); !ok {
-		return errors.New("runner cannot stream filesystem data")
 	}
 	source, err := e.streamRoot(ctx, p, driver)
 	if err != nil {
@@ -303,14 +300,14 @@ parents:
 	var args []string
 	command := ""
 	if m.Storage == "btrfs" {
-		if _, err = e.R.Run(ctx, nil, nil, "btrfs", "subvolume", "snapshot", "-r", p.StorageSource, m.Stream.Snapshot); err != nil {
+		if _, err = runCommand(ctx, "btrfs", "subvolume", "snapshot", "-r", p.StorageSource, m.Stream.Snapshot); err != nil {
 			return err
 		}
 		command = "btrfs"
 		args = []string{"send"}
 		if len(m.Stream.Parents) > 0 {
 			parent := m.Stream.Parents[len(m.Stream.Parents)-1]
-			b, err = e.R.Run(ctx, nil, nil, "btrfs", "property", "get", "-ts", parent.Snapshot, "ro")
+			b, err = runCommand(ctx, "btrfs", "property", "get", "-ts", parent.Snapshot, "ro")
 			if err != nil {
 				return err
 			}
@@ -321,7 +318,7 @@ parents:
 		}
 		args = append(args, m.Stream.Snapshot)
 	} else {
-		if _, err = e.R.Run(ctx, nil, nil, "zfs", "snapshot", m.Stream.Snapshot); err != nil {
+		if _, err = runCommand(ctx, "zfs", "snapshot", m.Stream.Snapshot); err != nil {
 			return err
 		}
 		command = "zfs"
@@ -343,7 +340,7 @@ parents:
 	if e.C.MaxStagingBytes > 0 {
 		writer = &boundedWriter{W: f, Remaining: e.C.MaxStagingBytes}
 	}
-	err = e.R.(StreamingRunner).RunStream(ctx, nil, nil, writer, command, args...)
+	err = runStream(ctx, nil, nil, writer, command, args...)
 	if err == nil {
 		err = f.Sync()
 	}
@@ -353,7 +350,7 @@ parents:
 	}
 
 	if m.Storage == "zfs" {
-		if b, err = e.R.Run(ctx, nil, nil, "zfs", "get", "-Hp", "-o", "value", "referenced,used", m.Stream.Snapshot); err == nil {
+		if b, err = runCommand(ctx, "zfs", "get", "-Hp", "-o", "value", "referenced,used", m.Stream.Snapshot); err == nil {
 			values := strings.Fields(string(b))
 			if len(values) >= 2 {
 				if n, er := strconv.ParseInt(values[0], 10, 64); er == nil {
@@ -365,7 +362,7 @@ parents:
 			}
 		}
 	} else {
-		if b, err = e.R.Run(ctx, nil, nil, "btrfs", "filesystem", "du", "-s", "--raw", m.Stream.Snapshot); err == nil {
+		if b, err = runCommand(ctx, "btrfs", "filesystem", "du", "-s", "--raw", m.Stream.Snapshot); err == nil {
 			for _, line := range strings.Split(string(b), "\n") {
 				fields := strings.Fields(line)
 				if len(fields) < 3 {
@@ -420,7 +417,7 @@ func (e Engine) commitStream(ctx context.Context, p Policy, m *Manifest) error {
 			cmd = "zfs"
 			args = []string{"destroy", old}
 		}
-		if _, err := e.R.Run(ctx, nil, nil, cmd, args...); err != nil {
+		if _, err := runCommand(ctx, cmd, args...); err != nil {
 			e.Log.Warn("verified chain retained; previous source snapshot cleanup failed", "job_id", m.ID)
 		}
 	}

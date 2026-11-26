@@ -8,12 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 )
 
-type Runner interface {
-	Run(context.Context, []string, []byte, string, ...string) ([]byte, error)
-}
-type ExecRunner struct{}
 type cappedBuffer struct{ bytes.Buffer }
 
 func (b *cappedBuffer) Write(p []byte) (int, error) {
@@ -27,17 +24,14 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	}
 	return n, nil
 }
-func (ExecRunner) Run(ctx context.Context, env []string, in []byte, cmd string, args ...string) ([]byte, error) {
-	c := exec.CommandContext(ctx, cmd, args...)
-	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
-	c.Env = append(os.Environ(), env...)
-	c.Stdin = bytes.NewReader(in)
+func runCommand(ctx context.Context, cmd string, args ...string) ([]byte, error) {
+	return runOutput(ctx, nil, nil, cmd, args...)
+}
+
+func runOutput(ctx context.Context, env []string, in []byte, cmd string, args ...string) ([]byte, error) {
 	var out cappedBuffer
-	c.Stdout = &out
-	c.Stderr = io.Discard
-	if e := c.Run(); e != nil {
-		return nil, fmt.Errorf("%s failed (%v); subprocess output suppressed to protect secrets", cmd, e)
+	if err := runStream(ctx, env, bytes.NewReader(in), &out, cmd, args...); err != nil {
+		return nil, err
 	}
 	if out.Len() >= 8<<20 {
 		return nil, fmt.Errorf("%s output exceeded limit", cmd)
@@ -45,21 +39,24 @@ func (ExecRunner) Run(ctx context.Context, env []string, in []byte, cmd string, 
 	return out.Bytes(), nil
 }
 
-// StreamingRunner keeps filesystem streams out of the bounded command-output buffer.
-type StreamingRunner interface {
-	RunStream(context.Context, []string, io.Reader, io.Writer, string, ...string) error
-}
-
-func (ExecRunner) RunStream(ctx context.Context, env []string, in io.Reader, out io.Writer, cmd string, args ...string) error {
+func runStream(ctx context.Context, env []string, in io.Reader, out io.Writer, cmd string, args ...string) error {
 	c := exec.CommandContext(ctx, cmd, args...)
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
+	if cmd == "restic" {
+		// Allow Restic to roll back an interrupted operation and release its lock.
+		c.Cancel = func() error { return c.Process.Signal(os.Interrupt) }
+		c.WaitDelay = 5 * time.Second
+	}
 	c.Env = append(os.Environ(), env...)
 	c.Stdin = in
 	c.Stdout = out
 	c.Stderr = io.Discard
 	if err := c.Run(); err != nil {
-		return fmt.Errorf("%s stream operation failed: %w (output suppressed)", cmd, err)
+		if ctx.Err() != nil {
+			err = context.Cause(ctx)
+		}
+		return fmt.Errorf("%s failed: %w", cmd, err)
 	}
 	return nil
 }

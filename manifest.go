@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -17,11 +19,9 @@ import (
 type State string
 
 const (
-	Pending            State = "Pending"
 	Running            State = "Running"
 	SnapshotCreated    State = "SnapshotCreated"
 	Exported           State = "Exported"
-	Uploaded           State = "Uploaded"
 	Verified           State = "Verified"
 	Failed             State = "Failed"
 	PartiallyCompleted State = "PartiallyCompleted"
@@ -102,29 +102,6 @@ func newID() string {
 	}
 	return "lxcer-" + hex.EncodeToString(b[:])
 }
-func (m *Manifest) transition(s State) error {
-	valid := false
-	switch m.State {
-	case Pending:
-		valid = s == Running || s == Failed
-	case Running:
-		valid = s == SnapshotCreated || s == Exported
-	case SnapshotCreated:
-		valid = s == Exported
-	case Exported:
-		valid = s == Uploaded || s == PartiallyCompleted
-	case Uploaded:
-		valid = s == Verified || s == PartiallyCompleted
-	}
-	if s == Failed && m.State != Verified {
-		valid = true
-	}
-	if !valid {
-		return fmt.Errorf("invalid job transition %s -> %s", m.State, s)
-	}
-	m.State = s
-	return nil
-}
 func privateDir(path string) error {
 	if e := os.MkdirAll(path, 0700); e != nil {
 		return e
@@ -202,6 +179,13 @@ func loadManifest(path string) (Manifest, error) {
 				return m, err
 			}
 		}
+		destinations := make(map[string]bool, len(m.Destinations))
+		for _, d := range m.Destinations {
+			if !validName(d.Name) || destinations[d.Name] {
+				return m, errors.New("invalid or duplicate manifest destination")
+			}
+			destinations[d.Name] = true
+		}
 		for _, v := range m.Volumes {
 			if !validName(v.Device) || !validName(v.Name) || !validName(v.Pool) || !filepath.IsAbs(v.Artifact) || filepath.Base(filepath.Dir(v.Artifact)) != m.ID {
 				return m, errors.New("invalid volume artifact")
@@ -210,37 +194,119 @@ func loadManifest(path string) (Manifest, error) {
 	}
 	return m, e
 }
-func checksum(path string) (string, int64, error) {
-	f, e := os.Open(path)
-	if e != nil {
-		return "", 0, e
+
+// verificationComplete applies to scheduled backups. A legacy adoption has no receipt.
+func (m Manifest) verificationComplete() bool {
+	required := false
+	for _, d := range m.Destinations {
+		if d.Required {
+			required = true
+			if !d.Verified || !snapshotID(d.SnapshotID) || !snapshotID(d.ReceiptID) {
+				return false
+			}
+		}
+	}
+	return required
+}
+
+func manifestPaths(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, entry := range entries {
+		if !entry.IsDir() || !validName(entry.Name()) || !strings.HasPrefix(entry.Name(), "lxcer-") {
+			continue
+		}
+		path := filepath.Join(root, entry.Name(), "manifest.json")
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("%s: expected a regular manifest", entry.Name())
+		}
+		paths = append(paths, path)
+	}
+	return paths, nil
+}
+
+func checksum(ctx context.Context, path string) (string, int64, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return "", 0, err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	if !info.Mode().IsRegular() {
+		return "", 0, errors.New("backup artifact must be a regular file")
+	}
 	h := sha256.New()
-	n, e := io.Copy(h, f)
-	return hex.EncodeToString(h.Sum(nil)), n, e
+	var size int64
+	buf := make([]byte, 128<<10)
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", size, err
+		}
+		n, err := f.Read(buf)
+		_, _ = h.Write(buf[:n])
+		size += int64(n)
+		if err == io.EOF {
+			return hex.EncodeToString(h.Sum(nil)), size, nil
+		}
+		if err != nil {
+			return "", size, err
+		}
+	}
 }
+
+var errJobLocked = errors.New("job already locked; another process is active")
+
 func acquireLock(root, key string) (*os.File, error) { return acquireLockMode(root, key, false) }
-func acquireLockMode(root, key string, blocking bool) (*os.File, error) {
-	if e := privateDir(filepath.Join(root, "locks")); e != nil {
-		return nil, e
+func openLock(root, key string) (*os.File, error) {
+	if err := privateDir(filepath.Join(root, "locks")); err != nil {
+		return nil, err
 	}
 	sum := sha256.Sum256([]byte(key))
-	f, e := os.OpenFile(filepath.Join(root, "locks", hex.EncodeToString(sum[:])+".lock"), os.O_CREATE|os.O_RDWR, 0600)
-	if e != nil {
-		return nil, e
+	path := filepath.Join(root, "locks", hex.EncodeToString(sum[:])+".lock")
+	return os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+}
+
+func acquireLockMode(root, key string, blocking bool) (*os.File, error) {
+	f, err := openLock(root, key)
+	if err != nil {
+		return nil, err
 	}
 	mode := syscall.LOCK_EX
 	if !blocking {
 		mode |= syscall.LOCK_NB
 	}
-	if e = syscall.Flock(int(f.Fd()), mode); e != nil {
+	if err = syscall.Flock(int(f.Fd()), mode); err != nil {
 		f.Close()
-		return nil, errors.New("job already locked; another process is active")
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, errJobLocked
+		}
+		return nil, err
 	}
 	return f, nil
 }
-func releaseLock(f *os.File) { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }
+
+func releaseLock(f *os.File) {
+	if f != nil {
+		_ = f.Close()
+	}
+}
+
 func freeSpace(path string, min uint64) error {
 	var s syscall.Statfs_t
 	if e := syscall.Statfs(path, &s); e != nil {

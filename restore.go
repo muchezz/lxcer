@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +31,9 @@ type RestoreOptions struct {
 }
 
 func (e Engine) destination(name string) (Destination, error) {
+	if name == "" && len(e.C.Destinations) == 1 {
+		return e.C.Destinations[0], nil
+	}
 	if name == "legacy-restore" && e.C.RestoreResticRepo.Path != "" {
 		d := e.C.RestoreResticRepo
 		d.Name = name
@@ -74,15 +78,15 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 		return errors.New("select a verified data snapshot ID")
 	}
 	imageRebuild := m.Strategy == "native" || m.Strategy == "storage-incremental"
-	if m.Strategy == "native" && opt.NativeTarget != "" {
+	if opt.NativeTarget != "" {
+		if m.Strategy != "native" {
+			return errors.New("-native-target requires a native filesystem backup")
+		}
 		if opt.Test && len(opt.Health) > 0 {
 			return errors.New("native offline restore tests cannot execute instance health commands")
 		}
-		if opt.NativeTarget == "" {
-			return errors.New("native backup requires -native-target (a new directory); instance reconstruction uses manifest metadata")
-		}
 		if opt.DryRun {
-			return nil
+			return r.verify(ctx, id, m.Paths)
 		}
 		if err = r.verify(ctx, id, m.Paths); err != nil {
 			return err
@@ -93,7 +97,7 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 		if err = privateDir(e.C.StateDir); err != nil {
 			return err
 		}
-		if err = os.MkdirAll(opt.NativeTarget, 0700); err != nil {
+		if err = makeRestoreTarget(opt.NativeTarget); err != nil {
 			return err
 		}
 		offlineCtx, guard, stop := e.guard(ctx, opt.NativeTarget)
@@ -116,9 +120,27 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 		}
 		return nil
 	}
-	l := LXD{R: e.R, Host: opt.Host}
+	l := LXD{Host: opt.Host}
 	if err = l.Detect(ctx); err != nil {
 		return err
+	}
+	renameImport := !imageRebuild && m.Strategy != "snapshot" && opt.Name != m.Instance.Name && (!l.Caps.Has("backup_override_name") || !l.Caps.ImportName)
+	if !opt.DryRun {
+		if err = privateDir(e.C.StateDir); err != nil {
+			return err
+		}
+		lock, err := acquireLock(e.C.StateDir, opt.Host+"/"+opt.Name)
+		if err != nil {
+			return err
+		}
+		defer releaseLock(lock)
+		if renameImport {
+			originalLock, er := acquireLock(e.C.StateDir, opt.Host+"/"+m.Instance.Name)
+			if er != nil {
+				return er
+			}
+			defer releaseLock(originalLock)
+		}
 	}
 	cc, err := l.List(ctx)
 	if err != nil {
@@ -129,7 +151,6 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 			return errors.New("restore collision: choose another name; overwrite is intentionally unavailable")
 		}
 	}
-	renameImport := !imageRebuild && m.Strategy != "snapshot" && opt.Name != m.Instance.Name && (!l.Caps.Has("backup_override_name") || !l.Caps.ImportName)
 	if renameImport {
 		for _, c := range cc {
 			if c.Name == m.Instance.Name {
@@ -201,22 +222,7 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 		}
 	}
 	if opt.DryRun {
-		return nil
-	}
-	if err = privateDir(e.C.StateDir); err != nil {
-		return err
-	}
-	lock, err := acquireLock(e.C.StateDir, opt.Host+"/"+opt.Name)
-	if err != nil {
-		return err
-	}
-	defer releaseLock(lock)
-	if renameImport {
-		originalLock, er := acquireLock(e.C.StateDir, opt.Host+"/"+m.Instance.Name)
-		if er != nil {
-			return er
-		}
-		defer releaseLock(originalLock)
+		return r.verify(ctx, id, m.Paths)
 	}
 	owned := false
 	created := false
@@ -264,11 +270,11 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 		if err = r.verify(ctx, id, []string{m.Artifact}); err != nil {
 			return err
 		}
-		if _, err = r.run(ctx, "restore", id, "--target", staging, "--include", m.Artifact, "--verify"); err != nil {
+		if err = r.restorePath(ctx, id, staging, m.Artifact); err != nil {
 			return err
 		}
 		artifact = filepath.Join(staging, strings.TrimPrefix(filepath.Clean(m.Artifact), "/"))
-		sum, _, err := checksum(artifact)
+		sum, _, err := checksum(ctx, artifact)
 		if err != nil {
 			return err
 		}
@@ -276,7 +282,7 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 			return errors.New("restore archive checksum mismatch")
 		}
 		if strings.HasSuffix(artifact, ".zst") {
-			if _, err = e.R.Run(ctx, nil, nil, "zstd", "-d", "-T1", artifact, "-o", artifact+".tar"); err != nil {
+			if _, err = runCommand(ctx, "zstd", "-d", "-T1", artifact, "-o", artifact+".tar"); err != nil {
 				return err
 			}
 			artifact += ".tar"
@@ -312,11 +318,11 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 					return errors.New("managed volume restore collision")
 				}
 			}
-			if _, er = r.run(ctx, "restore", id, "--target", staging, "--include", v.Artifact, "--verify"); er != nil {
+			if er = r.restorePath(ctx, id, staging, v.Artifact); er != nil {
 				return er
 			}
 			vp := filepath.Join(staging, strings.TrimPrefix(filepath.Clean(v.Artifact), "/"))
-			sum, _, er := checksum(vp)
+			sum, _, er := checksum(ctx, vp)
 			if er != nil {
 				return er
 			}
@@ -333,8 +339,17 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 		if opt.Test && created && owned {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
-			_, er := l.run(cleanupCtx, "delete", l.ref(opt.Name), "--force")
-			result = errors.Join(result, er)
+			marker, err := l.run(cleanupCtx, "config", "get", l.ref(opt.Name), "user.lxcer.restore")
+			if err == nil {
+				if strings.TrimSpace(string(marker)) == alias {
+					_, err = l.run(cleanupCtx, "delete", l.ref(opt.Name), "--force")
+				} else {
+					err = errors.New("restore target ownership changed")
+				}
+			}
+			if err != nil {
+				result = errors.Join(result, fmt.Errorf("restore test cleanup: %w", err))
+			}
 		}
 	}()
 	if m.Strategy == "snapshot" || imageRebuild {
@@ -346,11 +361,11 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 			if err = r.verify(ctx, id, []string{part.Artifact}); err != nil {
 				return err
 			}
-			if _, err = r.run(ctx, "restore", id, "--target", staging, "--include", part.Artifact, "--verify"); err != nil {
+			if err = r.restorePath(ctx, id, staging, part.Artifact); err != nil {
 				return err
 			}
 			path := filepath.Join(staging, strings.TrimPrefix(filepath.Clean(part.Artifact), "/"))
-			sum, _, er := checksum(path)
+			sum, _, er := checksum(ctx, path)
 			if er != nil {
 				return er
 			}
@@ -443,7 +458,6 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 	}
 	profiles := []string{}
 	if opt.Test {
-		profiles = []string{}
 		for k := range cfg {
 			if strings.HasPrefix(k, "security.") {
 				delete(cfg, k)
@@ -455,7 +469,7 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 	if err != nil {
 		return err
 	}
-	if _, err = e.R.Run(ctx, nil, b, "lxc", "config", "edit", l.ref(opt.Name)); err != nil {
+	if _, err = runOutput(ctx, nil, b, "lxc", "config", "edit", l.ref(opt.Name)); err != nil {
 		return err
 	}
 	owned = true
@@ -500,72 +514,197 @@ func (e Engine) restore(ctx context.Context, m *Manifest, opt RestoreOptions) (r
 	}
 	return nil
 }
-func (e Engine) recoverCatalog(ctx context.Context, d Destination, id, target string) error {
-	if !snapshotID(id) {
-		return errors.New("exact receipt snapshot ID required")
-	}
-	if _, err := os.Lstat(target); !os.IsNotExist(err) {
-		return errors.New("catalog recovery target must not exist")
-	}
-	if err := os.MkdirAll(target, 0700); err != nil {
+func (e Engine) saveRestoreTest(path string, result Manifest) error {
+	if err := privateDir(e.C.StateDir); err != nil {
 		return err
 	}
-	_, err := e.repo(d).run(ctx, "restore", id, "--target", target, "--verify")
-	return err
-}
-func (e Engine) recoverJobs(ctx context.Context, execute bool) error {
-	files, err := filepath.Glob(filepath.Join(e.C.StateDir, "lxcer-*", "manifest.json"))
+	lock, err := acquireLock(e.C.StateDir, sourceRemote(result)+"/"+result.Instance.Name)
+	if err != nil {
+		return fmt.Errorf("record restore test result: %w", err)
+	}
+	defer releaseLock(lock)
+	current, err := loadManifest(path)
 	if err != nil {
 		return err
 	}
-	for _, f := range files {
-		m, er := loadManifest(f)
-		if er != nil {
-			return er
-		}
-		if m.Completed.IsZero() || m.NeedsResume {
-			lock, er := acquireLock(e.C.StateDir, m.Host+"/"+m.Instance.Name)
-			if er != nil {
-				continue
-			}
-			if execute {
-				if m.NeedsResume {
-					l := LXD{R: e.R, Host: sourceRemote(m)}
-					if er = e.hooks(ctx, l, m.Instance, m.ResumeHooks); er != nil {
-						releaseLock(lock)
-						return er
-					}
-					m.NeedsResume = false
-				}
-				m.State = Failed
-				m.Error = "interrupted job: retained resources; verify repositories and resume application before manual recovery"
-				m.Completed = time.Now().UTC()
-				er = m.save(filepath.Dir(f))
-			}
-			releaseLock(lock)
-			if er != nil {
-				return er
-			}
-			fmt.Printf("%s interrupted; resources retained\n", m.ID)
-		}
+	if current.ID != result.ID || current.Host != result.Host || current.Instance.Name != result.Instance.Name {
+		return errors.New("manifest identity changed during restore test")
+	}
+	if current.RestoreTest != nil && !result.RestoreTest.Time.After(current.RestoreTest.Time) {
+		return nil
+	}
+	current.RestoreTest = result.RestoreTest
+	return current.save(filepath.Dir(path))
+}
 
-		if m.State == Failed || m.State == PartiallyCompleted {
-			fmt.Printf("%s retained state=%s snapshot=%s image=%s artifact=%s\n", m.ID, m.State, m.Snapshot, m.ImageFingerprint, m.Artifact)
-		}
-		if m.State == Verified {
-			fmt.Printf("%s eligible for cleanup\n", m.ID)
-			if execute {
-				lock, lockErr := acquireLock(e.C.StateDir, m.Host+"/"+m.Instance.Name)
-				if lockErr != nil {
-					continue
-				}
-				if er = e.cleanup(ctx, &m, filepath.Dir(f), false); er != nil {
-					releaseLock(lock)
-					return er
-				}
-				releaseLock(lock)
+func (e Engine) recoverCatalog(ctx context.Context, d Destination, id, target string) error {
+	r := e.repo(d)
+	snapshot, err := r.snapshot(ctx, id)
+	if err != nil {
+		return err
+	}
+	var manifestPath string
+	for _, path := range snapshot.Paths {
+		parent := filepath.Base(filepath.Dir(path))
+		if filepath.IsAbs(path) && validName(parent) && strings.HasPrefix(parent, "lxcer-") && filepath.Base(path) == "manifest.json" {
+			if manifestPath != "" {
+				return errors.New("snapshot contains multiple catalog manifest paths")
 			}
+			manifestPath = path
 		}
 	}
-	return nil
+	if manifestPath == "" {
+		return errors.New("snapshot does not contain an lxcer catalog manifest")
+	}
+	if err := r.verifyNode(ctx, snapshot.ID, manifestPath); err != nil {
+		return err
+	}
+	if err := privateDir(e.C.StateDir); err != nil {
+		return err
+	}
+	if err := makeRestoreTarget(target); err != nil {
+		return err
+	}
+	ctx, guard, stop := e.guard(ctx, target)
+	defer stop()
+	if err := guard.check(); err != nil {
+		return err
+	}
+	if err := r.restorePath(ctx, snapshot.ID, target, manifestPath); err != nil {
+		return err
+	}
+	if err := guard.check(); err != nil {
+		return err
+	}
+	_, err = loadManifest(filepath.Join(target, strings.TrimPrefix(filepath.Clean(manifestPath), "/")))
+	return errors.Join(err, context.Cause(ctx))
+}
+
+func makeRestoreTarget(target string) error {
+	if target == "" {
+		return errors.New("new restore target directory required")
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		return err
+	}
+	return os.Mkdir(target, 0700)
+}
+
+func (e Engine) recoverJobs(ctx context.Context, out io.Writer, execute bool) error {
+	files, err := manifestPaths(e.C.StateDir)
+	if err != nil {
+		return err
+	}
+	if execute && len(files) > 0 {
+		if err := privateDir(e.C.StateDir); err != nil {
+			return err
+		}
+	}
+	var errs []error
+	for _, path := range files {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
+		if err := e.recoverJob(ctx, out, path, execute); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", path, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (e Engine) recoverJob(ctx context.Context, out io.Writer, path string, execute bool) error {
+	m, err := loadManifest(path)
+	if err != nil {
+		return err
+	}
+	if m.Legacy || (m.Cleanup == "completed" && !m.NeedsResume && !m.Completed.IsZero()) {
+		return nil
+	}
+	if !execute {
+		return e.recoverManifest(ctx, out, path, m, false)
+	}
+	lock, err := acquireLock(e.C.StateDir, sourceRemote(m)+"/"+m.Instance.Name)
+	if errors.Is(err, errJobLocked) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer releaseLock(lock)
+
+	// An active backup could have completed between the initial read and the lock.
+	current, err := loadManifest(path)
+	if err != nil {
+		return err
+	}
+	if current.ID != m.ID || current.Host != m.Host || sourceRemote(current) != sourceRemote(m) || current.Instance.Name != m.Instance.Name {
+		return errors.New("job identity changed while acquiring recovery lock")
+	}
+	return e.recoverManifest(ctx, out, path, current, true)
+}
+
+func (e Engine) recoverManifest(ctx context.Context, out io.Writer, path string, m Manifest, execute bool) error {
+	if m.Legacy || (m.Cleanup == "completed" && !m.NeedsResume && !m.Completed.IsZero()) {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	if m.NeedsResume || (m.Completed.IsZero() && (m.State != Verified || !m.verificationComplete())) {
+		if !execute {
+			fmt.Fprintf(out, "%s unfinished; resources retained\n", m.ID)
+			return nil
+		}
+		fmt.Fprintf(out, "%s interrupted; resources retained\n", m.ID)
+		if m.NeedsResume {
+			l := LXD{Host: sourceRemote(m)}
+			if err := e.hooks(ctx, l, m.Instance, m.ResumeHooks); err != nil {
+				return err
+			}
+			m.NeedsResume = false
+		}
+		m.State = Failed
+		m.Error = "interrupted job; resources retained"
+		m.Completed = time.Now().UTC()
+		return m.save(dir)
+	}
+	if m.State != Verified {
+		fmt.Fprintf(out, "%s retained state=%s snapshot=%s image=%s artifact=%s\n", m.ID, m.State, m.Snapshot, m.ImageFingerprint, m.Artifact)
+		return nil
+	}
+	if !m.verificationComplete() {
+		return errors.New("required destination verification is incomplete; resources retained")
+	}
+	for _, s := range m.Destinations {
+		if !s.Verified || !snapshotID(s.SnapshotID) || !snapshotID(s.ReceiptID) {
+			fmt.Fprintf(out, "%s missing verified destination receipt; resources retained\n", m.ID)
+			return nil
+		}
+	}
+	fmt.Fprintf(out, "%s eligible for cleanup\n", m.ID)
+	if !execute {
+		return nil
+	}
+	if m.Completed.IsZero() {
+		m.Completed = time.Now().UTC()
+		m.Error = "backup command interrupted after verification"
+		if err := m.save(dir); err != nil {
+			return err
+		}
+	}
+	if m.Cleanup == "completed" {
+		return nil
+	}
+	for _, s := range m.Destinations {
+		d, err := e.destination(s.Name)
+		if err != nil {
+			return err
+		}
+		r := e.repo(d)
+		if err := r.verify(ctx, s.SnapshotID, m.Paths); err != nil {
+			return err
+		}
+		if err := r.verify(ctx, s.ReceiptID, nil); err != nil {
+			return err
+		}
+	}
+	return e.cleanup(ctx, &m, dir)
 }

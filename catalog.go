@@ -6,14 +6,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
-	"time"
 )
 
 var errNoCatalog = errors.New("no verified catalog entry for requested source")
 
-func (e Engine) findManifest(name, host string) (Manifest, string, error) {
-	files, err := filepath.Glob(filepath.Join(e.C.StateDir, "lxcer-*", "manifest.json"))
+func (e Engine) findManifest(name, host, destination, snapshot string) (Manifest, string, error) {
+	files, err := manifestPaths(e.C.StateDir)
 	if err != nil {
 		return Manifest{}, "", err
 	}
@@ -25,6 +25,11 @@ func (e Engine) findManifest(name, host string) (Manifest, string, error) {
 			return found, "", er
 		}
 		if m.Instance.Name != name || (host != "" && m.Host != host) || (m.State != Verified && m.State != PartiallyCompleted) {
+			continue
+		}
+		if destination != "" && snapshot == "" && !slices.ContainsFunc(m.Destinations, func(d DestinationStatus) bool {
+			return d.Name == destination && d.Verified && snapshotID(d.SnapshotID)
+		}) {
 			continue
 		}
 		if selected != "" && m.Host != found.Host && host == "" {
@@ -67,20 +72,14 @@ func (e Engine) adoptLegacy(ctx context.Context, destination, id, artifact, meta
 		return m, err
 	}
 
-	snapshotJSON, err := r.run(ctx, "snapshots", "--json", id)
+	snap, err := r.snapshot(ctx, id)
 	if err != nil {
 		return m, err
 	}
-	var metadataRows []struct {
-		Time time.Time `json:"time"`
-	}
-	if err = json.Unmarshal(snapshotJSON, &metadataRows); err != nil {
-		return m, err
-	}
-	if len(metadataRows) != 1 || metadataRows[0].Time.IsZero() {
+	if snap.Time.IsZero() {
 		return m, errors.New("legacy snapshot timestamp unavailable; cannot assign a reliable backup age")
 	}
-	capturedAt := metadataRows[0].Time
+	capturedAt := snap.Time
 	if err = privateDir(e.C.StateDir); err != nil {
 		return m, err
 	}
@@ -88,12 +87,26 @@ func (e Engine) adoptLegacy(ctx context.Context, destination, id, artifact, meta
 	if err != nil {
 		return m, err
 	}
-	if _, err = r.run(ctx, "restore", id, "--target", staging, "--include", artifact, "--verify"); err != nil {
+	ctx, guard, stop := e.guard(ctx, staging)
+	defer stop()
+	if err = guard.check(); err != nil {
 		return m, err
 	}
-	sum, size, err := checksum(filepath.Join(staging, strings.TrimPrefix(filepath.Clean(artifact), "/")))
+	if err = r.restorePath(ctx, id, staging, artifact); err != nil {
+		return m, err
+	}
+	sum, size, err := checksum(ctx, filepath.Join(staging, strings.TrimPrefix(filepath.Clean(artifact), "/")))
 	if err != nil {
 		return m, err
+	}
+	if err = guard.check(); err != nil {
+		return m, err
+	}
+	if err = ctx.Err(); err != nil {
+		return m, err
+	}
+	if size == 0 {
+		return m, errors.New("legacy archive is empty")
 	}
 	jobID := newID()
 	dir := filepath.Join(e.C.StateDir, jobID)

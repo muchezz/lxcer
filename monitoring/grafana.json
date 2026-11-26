@@ -1,7 +1,7 @@
 {
   "title": "lxcer backups",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "time": {
     "from": "now-7d",
     "to": "now"
@@ -10,7 +10,7 @@
     {
       "id": 1,
       "type": "timeseries",
-      "title": "lxcer_backup_success",
+      "title": "Latest completed instance backup",
       "gridPos": {
         "x": 0,
         "y": 0,
@@ -31,7 +31,7 @@
     {
       "id": 2,
       "type": "timeseries",
-      "title": "time() - lxcer_backup_last_success_timestamp_seconds",
+      "title": "Time since last successful backup",
       "gridPos": {
         "x": 12,
         "y": 0,
@@ -44,7 +44,7 @@
       },
       "targets": [
         {
-          "expr": "time() - lxcer_backup_last_success_timestamp_seconds",
+          "expr": "(time() - lxcer_backup_last_success_timestamp_seconds) and (lxcer_backup_last_success_timestamp_seconds > 0)",
           "refId": "A"
         }
       ]
@@ -52,7 +52,7 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "lxcer_backup_duration_seconds",
+      "title": "Backup duration",
       "gridPos": {
         "x": 0,
         "y": 8,
@@ -73,7 +73,7 @@
     {
       "id": 4,
       "type": "timeseries",
-      "title": "lxcer_backup_size_bytes",
+      "title": "Staged artifact size",
       "gridPos": {
         "x": 12,
         "y": 8,
@@ -94,7 +94,7 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "lxcer_backup_verification_failures_total",
+      "title": "Verification failures",
       "gridPos": {
         "x": 0,
         "y": 16,
@@ -115,7 +115,7 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "lxcer_restore_test_success",
+      "title": "Latest restore test",
       "gridPos": {
         "x": 12,
         "y": 16,
@@ -129,6 +129,48 @@
       "targets": [
         {
           "expr": "lxcer_restore_test_success",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Staging peak",
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "lxcer_backup_staging_peak_bytes",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Latest scheduled command result",
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "lxcer_backup_run_success",
           "refId": "A"
         }
       ]

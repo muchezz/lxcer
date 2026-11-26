@@ -54,22 +54,17 @@ func (w *nodeFinder) Write(p []byte) (int, error) {
 }
 func (r Repository) verifyNode(ctx context.Context, id, path string) error {
 	finder := &nodeFinder{path: path}
-	if sr, ok := r.R.(StreamingRunner); ok {
-		env, err := r.env()
-		if err != nil {
-			return err
-		}
-		if err = sr.RunStream(ctx, env, nil, finder, "restic", "ls", "--json", id, path); err != nil {
-			return err
-		}
-	} else {
-		b, err := r.run(ctx, "ls", "--json", id, path)
-		if err != nil {
-			return err
-		}
-		if _, err = finder.Write(b); err != nil {
-			return err
-		}
+	env, err := r.env()
+	if err != nil {
+		return err
+	}
+	lock, err := r.lock(ctx, false)
+	if err != nil {
+		return err
+	}
+	defer releaseLock(lock)
+	if err = runStream(ctx, env, nil, finder, "restic", "ls", "--retry-lock", "1m", "--json", id, path); err != nil {
+		return err
 	}
 	if err := finder.row(finder.pending); err != nil {
 		return err

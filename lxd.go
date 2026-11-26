@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -39,7 +41,6 @@ func (c Capabilities) Has(s string) bool {
 }
 
 type LXD struct {
-	R    Runner
 	Host string
 	Caps Capabilities
 }
@@ -51,7 +52,11 @@ func (l LXD) ref(n string) string {
 	return l.Host + ":" + n
 }
 func (l LXD) run(ctx context.Context, args ...string) ([]byte, error) {
-	return l.R.Run(ctx, nil, nil, "lxc", args...)
+	b, err := runCommand(ctx, "lxc", args...)
+	if err != nil {
+		return nil, fmt.Errorf("LXD %s on %s: %w", args[0], l.Host, err)
+	}
+	return b, nil
 }
 func (l *LXD) Detect(ctx context.Context) error {
 	b, e := l.run(ctx, "query", l.ref("/1.0"))
@@ -78,12 +83,9 @@ func (l *LXD) Detect(ctx context.Context) error {
 	if l.Caps.Server == "" {
 		return errors.New("server returned no version")
 	}
-	b, e = l.run(ctx, "version")
+	b, e = l.run(ctx, "--version")
 	if e != nil {
-		b, e = l.run(ctx, "--version")
-		if e != nil {
-			return e
-		}
+		return e
 	}
 	l.Caps.Client = strings.TrimSpace(string(b))
 	b, e = l.run(ctx, "export", "--help")
@@ -104,32 +106,17 @@ func (l LXD) List(ctx context.Context) ([]Container, error) {
 	e = json.Unmarshal(b, &cc)
 	return cc, e
 }
-func filterContainers(cc []Container, blacklist []string) []Container {
+func selectContainers(cc []Container, blacklist []string, name string) ([]Container, error) {
+	if name != "" && !validName(name) {
+		return nil, errors.New("invalid instance name")
+	}
 	var out []Container
 	for _, c := range cc {
-		excluded := false
-		for _, b := range blacklist {
-			if b == c.Name {
-				excluded = true
-			}
-		}
-		if !excluded {
+		if !slices.Contains(blacklist, c.Name) && (name == "" || c.Name == name) {
 			out = append(out, c)
 		}
 	}
-	return out
-}
-func selectContainers(cc []Container, blacklist []string, name string) ([]Container, error) {
-	out := filterContainers(cc, blacklist)
-	if name != "" {
-		if !validName(name) {
-			return nil, errors.New("invalid instance name")
-		}
-		for _, c := range out {
-			if c.Name == name {
-				return []Container{c}, nil
-			}
-		}
+	if name != "" && len(out) == 0 {
 		return nil, fmt.Errorf("requested instance %q missing or excluded", name)
 	}
 	if len(out) == 0 {
@@ -221,9 +208,6 @@ func chooseStrategy(p Policy, cap Capabilities, c Container) (string, error) {
 		if p.NativeRoot == "" {
 			return "", errors.New("native requires native_root: the source root filesystem directory")
 		}
-		if len(p.Paths) == 0 && p.NativeRoot == "" {
-			return "", errors.New("native requires explicit filesystem paths")
-		}
 		if c.StatusCode == 103 && len(p.Hooks.Quiesce) == 0 {
 			return "", errors.New("running native backup requires quiesce/resume hooks")
 		}
@@ -245,6 +229,9 @@ func effectiveConfig(c Container) map[string]string {
 }
 
 func unwrapAPI(b []byte) ([]byte, error) {
+	if b = bytes.TrimSpace(b); len(b) == 0 || b[0] != '{' {
+		return b, nil
+	}
 	var wrapper map[string]json.RawMessage
 	if err := json.Unmarshal(b, &wrapper); err != nil {
 		return nil, err

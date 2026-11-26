@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -95,11 +96,16 @@ func readConfig(path string) (Config, error) {
 	d := yaml.NewDecoder(strings.NewReader(string(b)))
 	d.KnownFields(true)
 	if e = d.Decode(&c); e != nil {
-		return c, e
+		// YAML type errors can quote values supplied for password fields.
+		return c, errors.New("invalid configuration YAML or unknown field")
+	}
+	var extra yaml.Node
+	if e = d.Decode(&extra); e != io.EOF {
+		return c, errors.New("configuration must contain one YAML document")
 	}
 	var fields map[string]yaml.Node
-	if e = yaml.Unmarshal(b, &fields); e != nil {
-		return c, e
+	if e = yaml.Unmarshal(b, &fields); e != nil || fields == nil {
+		return c, errors.New("configuration must be a YAML mapping")
 	}
 	_, versioned := fields["version"]
 	c.Legacy = !versioned
@@ -136,7 +142,7 @@ func readConfig(path string) (Config, error) {
 	}
 	if len(c.Inventory) == 0 {
 		for _, h := range c.Hosts {
-			c.Inventory = append(c.Inventory, Host{Name: h, Workers: 1})
+			c.Inventory = append(c.Inventory, Host{Name: h, Workers: c.Workers})
 		}
 	}
 	if c.Policy.Strategy == "" {

@@ -1,7 +1,5 @@
 /lxcer
 /lxcer-state/
 /dist/
-/coverage.out
-*.test
 /bin/
 /dev/

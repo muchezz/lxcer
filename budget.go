@@ -42,9 +42,6 @@ func directoryBytes(dir string) (int64, error) {
 	return n, err
 }
 func (g *stagingGuard) check() error {
-	if g.C.MaxStagingBytes == 0 && g.C.MinFreeBytes == 0 {
-		return nil
-	}
 	n, err := directoryBytes(g.Dir)
 	if err != nil {
 		return err
@@ -70,7 +67,7 @@ func (g *stagingGuard) check() error {
 			return er
 		}
 		for _, d := range entries {
-			if d.IsDir() && (strings.HasPrefix(d.Name(), "lxcer-") || strings.HasPrefix(d.Name(), "restore-")) {
+			if d.IsDir() && (strings.HasPrefix(d.Name(), "lxcer-") || strings.HasPrefix(d.Name(), "restore-") || strings.HasPrefix(d.Name(), "adopt-")) {
 				size, er := directoryBytes(filepath.Join(g.C.StateDir, d.Name()))
 				if er != nil {
 					if errors.Is(er, os.ErrNotExist) {

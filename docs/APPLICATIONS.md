@@ -15,64 +15,31 @@ Recommended hook script contracts (scripts are application- and installation-spe
 
 A pre hook can use `argv: ["/usr/local/sbin/lxcer-postgresql-dump"]` with `timeout: 30m`; analogous scripts apply to the other rows. Passwords belong in protected files/service identities, never hook argv. If dumps are complete recovery artifacts, a snapshot can remain crash-consistent while application recovery uses the dumps. If recovering raw live application files, configure quiesce/resume and qualify that workflow separately.
 
-## LXD 3.0.3 running GitLab, backup server and Hetzner Storage Box
+## Back up an instance with a bind mount
 
-Assume `legacy` is an authenticated LXC remote for a 3.0.3 source; `gitlab` is running with `/srv/gitlab-data` bound at `/var/opt/gitlab`. A separate backup server runs lxcer. A stopped staging container is also selected (it is not filtered out). No service is stopped by the configuration below unless your explicitly installed scripts do so.
-
-Because the bind mount is source-host data, run a source-side agent through the backup server's SSH inventory. Its private state/staging directory must have sufficient space. The controller configuration:
+An LXD export covers the root disk. To capture a host directory mounted into a running instance, add it to the instance's `paths` and run lxcer on the source with quiesce and resume hooks. For example, the following source configuration captures an application instance and the data in `/srv/example-data`. Replace the instance name, path, scripts, and Restic destination with your own values.
 
 ```yaml
 version: 1
-workers: 2
-inventory:
-  - name: legacy-agent
-    ssh: legacy-agent
-    agent_binary: /opt/lxcer/lxcer
-    remote_config: /etc/lxcer/legacy-agent.yml
-# All jobs use source-side agents; repository credentials live only on agents.
-```
-
-Configure the SSH alias with a dedicated identity and pinned host key. Install the same reviewed binary on the source agent. On that source, `/etc/lxcer/legacy-agent.yml`:
-
-```yaml
-version: 1
-state_dir: /srv/lxcer-private
-workers: 1
-compression: zstd
-timeout: 4h
+state_dir: /var/lib/lxcer
 inventory:
   - name: local
-    workers: 1
-    policy:
-      strategy: snapshot
     instances:
-      gitlab:
-        paths: [/srv/gitlab-data]
+      example:
+        paths: [/srv/example-data]
         hooks:
           pre:
-            - argv: [/usr/local/sbin/lxcer-gitlab-backup]
-              timeout: 2h
+            - argv: [/usr/local/sbin/lxcer-dump]
           quiesce:
-            - argv: [/usr/local/sbin/lxcer-gitlab-quiesce]
-              timeout: 5m
+            - argv: [/usr/local/sbin/lxcer-quiesce]
           resume:
-            - argv: [/usr/local/sbin/lxcer-gitlab-resume]
-              timeout: 5m
-      stopped-staging:
-        strategy: snapshot
+            - argv: [/usr/local/sbin/lxcer-resume]
 destinations:
-  - name: storagebox
-    path: sftp:storagebox:/home/lxcer
+  - name: offsite
+    path: sftp:backup-repository:/backups/lxcer
     password_file: /etc/lxcer/restic-password
-    check: true
-    keep_daily: 14
-    keep_weekly: 8
 ```
 
-`storagebox` is an SSH config alias for the Storage Box endpoint; configure its assigned user and port (commonly 23) from the account, a pinned key and dedicated key authentication. Do not put the account password or private key in YAML. Use Restic's SFTP repository syntax and initialize it separately.
+Configure `backup-repository` as an SSH alias under the backup account and initialize the Restic repository separately. To schedule this source from a controller, use an SSH agent inventory entry with an absolute `remote_config` pointing to the source's configuration. [Host and instance policies](CONFIGURATION.md#host-and-instance-policies)
 
-The pre script must finish GitLab's version-specific backup command successfully, secure its output and capture `/etc/gitlab` including `gitlab.rb` and `gitlab-secrets.json`. Those paths are in the root image unless separately mounted; inspect expanded devices and add any host source paths. GitLab's native backup does not automatically cover all external object storage/registry dependencies; include those independently. The quiesce/resume scripts must coordinate GitLab writers for raw bind/root capture and be idempotent. Their deployment is explicit authorization for the service impact; validate first on an isolated clone. Source-side scanning may keep writers quiesced during a long offsite upload, so prefer application dumps plus a qualified local consistent staging path for large installations.
-
-Run the controller's backup command with `-concurrently`. The source agent includes both running GitLab and stopped staging, publishes unique snapshots/images using the legacy adapter, captures explicit bind data directly with Restic, verifies data snapshot paths and receipt before cleanup, and retains failure artifacts. No full container is copied to the backup server. The backup server orchestrates and monitors SSH status; detailed manifests/metrics remain on the source agent. A direct LXD-remote-only backup would reject the excluded bind mount; `allow_excluded` is not a substitute for protecting it.
-
-Recover the root image into an isolated stopped staging instance on a separate compatible host, restore bind data into a new filesystem target with Restic, review/remap the external attachment, then use the matching GitLab restore procedure and validate databases/repositories/secrets before changing DNS or starting production services. The automatic root-only test intentionally excludes production bind mounts. LXD 3.0.3 command/storage behavior remains unverified until the disposable matrix passes; this is a concrete deployment configuration, not a claim of real-host qualification.
+Recover the root disk to an isolated instance and restore the bind data to a separate filesystem target. Review the instance's disk mappings and verify application data before reconnecting it. The root-only recovery check omits external mounts. [Recovery guide](RESTORE.md)

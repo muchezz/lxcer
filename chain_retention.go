@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -56,7 +57,7 @@ func retentionIDs(snapshots []retainedSnapshot, d Destination, host, instance st
 			g = &group{key: key}
 			groups[key] = g
 		}
-		if tags["lxcer-chain"] && !s.Confirmed {
+		if !s.Confirmed {
 			g.protected = true
 		}
 		g.ids = append(g.ids, s.ID)
@@ -109,51 +110,69 @@ func retentionIDs(snapshots []retainedSnapshot, d Destination, host, instance st
 	sort.Strings(forget)
 	return forget, nil
 }
-func (r Repository) chainRetention(ctx context.Context, host, instance string, dry bool) error {
+func (r Repository) chainRetention(ctx context.Context, host, instance string, execute bool) ([]string, error) {
 	b, err := r.run(ctx, "snapshots", "--json", "--tag", "lxcer-data,host="+host+",instance="+instance)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var rows []retainedSnapshot
 	if err = json.Unmarshal(b, &rows); err != nil {
-		return err
+		return nil, err
 	}
 
 	receiptJSON, err := r.run(ctx, "snapshots", "--json", "--tag", "lxcer-receipt,host="+host+",instance="+instance)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var receipts []retainedSnapshot
 	if err = json.Unmarshal(receiptJSON, &receipts); err != nil {
-		return err
+		return nil, err
+	}
+	// Older receipts identify only the job. Trust that association only if
+	// the repository has exactly one data snapshot for that job.
+	jobCount := map[string]int{}
+	for _, row := range rows {
+		for _, tag := range row.Tags {
+			if strings.HasPrefix(tag, "job=") {
+				jobCount[tag]++
+			}
+		}
 	}
 	confirmed := map[string]bool{}
+	legacyJobs := map[string]bool{}
 	for _, receipt := range receipts {
+		if !slices.Contains(receipt.Tags, "lxcer-receipt") || !slices.Contains(receipt.Tags, "host="+host) || !slices.Contains(receipt.Tags, "instance="+instance) {
+			return nil, errors.New("retention receipt escaped explicit scope")
+		}
+		var exact bool
 		for _, tag := range receipt.Tags {
-			if strings.HasPrefix(tag, "job=") {
-				confirmed[tag] = true
+			if id, ok := strings.CutPrefix(tag, "data="); ok {
+				exact = true
+				if snapshotID(id) {
+					confirmed[id] = true
+				}
+			}
+		}
+		if !exact {
+			for _, tag := range receipt.Tags {
+				if jobCount[tag] == 1 {
+					legacyJobs[tag] = true
+				}
 			}
 		}
 	}
 	for i, row := range rows {
+		rows[i].Confirmed = confirmed[row.ID]
 		for _, tag := range row.Tags {
-			if confirmed[tag] {
+			if legacyJobs[tag] {
 				rows[i].Confirmed = true
 			}
 		}
 	}
 	ids, err := retentionIDs(rows, r.D, host, instance)
-	if err != nil {
-		return err
+	if err != nil || len(ids) == 0 || !execute {
+		return ids, err
 	}
-	if len(ids) == 0 {
-		return nil
-	}
-	args := []string{"forget"}
-	if dry {
-		args = append(args, "--dry-run")
-	}
-	args = append(args, ids...)
-	_, err = r.run(ctx, args...)
-	return err
+	_, err = r.run(ctx, append([]string{"forget"}, ids...)...)
+	return ids, err
 }

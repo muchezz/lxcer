@@ -15,12 +15,11 @@ import (
 
 type Engine struct {
 	C   Config
-	R   Runner
 	Log *slog.Logger
 }
 
 func (e Engine) repo(d Destination) Repository {
-	return Repository{R: e.R, D: d, Retries: e.C.Retries, Bandwidth: e.C.Bandwidth}
+	return Repository{D: d, Retries: e.C.Retries, Bandwidth: e.C.Bandwidth, StateDir: e.C.StateDir}
 }
 func (e Engine) hooks(ctx context.Context, l LXD, c Container, hs []Hook) error {
 	var errs []error
@@ -39,7 +38,18 @@ func (e Engine) hooks(ctx context.Context, l LXD, c Container, hs []Hook) error 
 	}
 	return errors.Join(errs...)
 }
-func (e Engine) Backup(ctx context.Context, hosts []Host, name string) error {
+func (e Engine) backup(ctx context.Context, hosts []Host, name string, concurrent bool) (result error) {
+	if err := privateDir(e.C.StateDir); err != nil {
+		return err
+	}
+	started := time.Now().UTC()
+	defer func() {
+		run := backupRun{Started: started, Completed: time.Now().UTC(), Success: result == nil}
+		result = errors.Join(result, e.writeMetrics(&run))
+	}()
+	if len(hosts) == 0 {
+		return errors.New("no hosts selected; use -local or inventory")
+	}
 	needsDestinations := false
 	for _, host := range hosts {
 		if host.SSH == "" {
@@ -58,9 +68,6 @@ func (e Engine) Backup(ctx context.Context, hosts []Host, name string) error {
 	if needsDestinations && !required {
 		return errors.New("at least one required destination is needed for safe cleanup")
 	}
-	if err := privateDir(e.C.StateDir); err != nil {
-		return err
-	}
 	global := make(chan struct{}, e.C.Workers)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -73,7 +80,6 @@ func (e Engine) Backup(ctx context.Context, hosts []Host, name string) error {
 		}
 	}
 	for _, h := range hosts {
-		h := h
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -90,22 +96,23 @@ func (e Engine) Backup(ctx context.Context, hosts []Host, name string) error {
 					agent = "lxcer"
 				}
 				command := shellQuote(agent) + " version >/dev/null && " + shellQuote(agent) + " -a backup -local -source-id " + shellQuote(h.Name) + " -config " + shellQuote(h.RemoteConfig)
-				a := []string{"-oBatchMode=yes", "-oStrictHostKeyChecking=yes", "--", h.SSH, command}
 				if name != "" {
-					a[len(a)-1] += " -container " + shellQuote(name)
+					command += " -container " + shellQuote(name)
 				}
-				_, err := e.R.Run(ctx, nil, nil, "ssh", a...)
-				add(err)
+				if concurrent {
+					command += " -concurrently"
+				}
+				if _, err := runCommand(ctx, "ssh", "-oBatchMode=yes", "-oStrictHostKeyChecking=yes", "--", h.SSH, command); err != nil {
+					add(fmt.Errorf("host %s: %w", h.Name, err))
+				}
 				return
 			}
-			hc, cancel := context.WithTimeout(ctx, e.C.Timeout)
-			defer cancel()
-			l := LXD{R: e.R, Host: h.Name}
-			if err := l.Detect(hc); err != nil {
+			l := LXD{Host: h.Name}
+			if err := l.Detect(ctx); err != nil {
 				add(fmt.Errorf("host %s: %w", h.Name, err))
 				return
 			}
-			cc, err := l.List(hc)
+			cc, err := l.List(ctx)
 			if err != nil {
 				add(err)
 				return
@@ -122,7 +129,6 @@ func (e Engine) Backup(ctx context.Context, hosts []Host, name string) error {
 			limit := make(chan struct{}, workers)
 			var jobs sync.WaitGroup
 			for _, c := range cc {
-				c := c
 				select {
 				case limit <- struct{}{}:
 				case <-ctx.Done():
@@ -144,16 +150,16 @@ func (e Engine) Backup(ctx context.Context, hosts []Host, name string) error {
 					defer func() { <-limit; <-global }()
 					p := mergePolicy(e.C.Policy, h.Policy)
 					p = mergePolicy(p, h.Instances[c.Name])
-					jc, stop := context.WithTimeout(ctx, e.C.Timeout)
-					defer stop()
-					add(e.backupOne(jc, l, c, p))
+					if err := e.backupOne(ctx, l, c, p); err != nil {
+						add(fmt.Errorf("backup %s/%s: %w", e.sourceHost(l), c.Name, err))
+					}
 				}()
 			}
 			jobs.Wait()
 		}()
 	}
 	wg.Wait()
-	return errors.Join(append(errs, e.writeMetrics())...)
+	return errors.Join(errs...)
 }
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
 func (e Engine) sourceHost(l LXD) string {
@@ -178,11 +184,24 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 	if !validName(c.Name) {
 		return errors.New("unsafe instance name from server")
 	}
-	lock, err := acquireLock(e.C.StateDir, e.sourceHost(l)+"/"+c.Name)
+	lock, err := acquireLock(e.C.StateDir, l.Host+"/"+c.Name)
 	if err != nil {
 		return err
 	}
 	defer releaseLock(lock)
+	journalPaths, err := manifestPaths(e.C.StateDir)
+	if err != nil {
+		return err
+	}
+	for _, path := range journalPaths {
+		job, err := loadManifest(path)
+		if err != nil {
+			return fmt.Errorf("read backup journal %s: %w", filepath.Base(filepath.Dir(path)), err)
+		}
+		if sourceRemote(job) == l.Host && job.Instance.Name == c.Name && job.NeedsResume {
+			return fmt.Errorf("%s still needs its resume hooks; run recover -execute", job.ID)
+		}
+	}
 	id := newID()
 	dir := filepath.Join(e.C.StateDir, id)
 	if err = privateDir(dir); err != nil {
@@ -190,16 +209,19 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 	}
 	ctx, g, stopGuard := e.guard(ctx, dir)
 	defer stopGuard()
-	m := Manifest{Version: 1, ID: id, Host: e.sourceHost(l), LXDRemote: l.Host, Instance: c, Capabilities: l.Caps, Started: time.Now().UTC(), State: Pending, Cleanup: "retained", Attachments: attachments(c)}
+	m := Manifest{Version: 1, ID: id, Host: e.sourceHost(l), LXDRemote: l.Host, Instance: c, Capabilities: l.Caps, Started: time.Now().UTC(), State: Running, Cleanup: "retained", Attachments: attachments(c)}
 	log := e.Log.With("job_id", id, "host", m.Host, "instance", c.Name)
+	cleanupReady := false
 	defer func() {
 		result = errors.Join(result, context.Cause(ctx))
 		m.StagingPeakBytes = g.peak.Load()
 		if result != nil {
-			if m.State == Verified {
-				m.State = PartiallyCompleted
-			} else if m.State != PartiallyCompleted {
-				_ = m.transition(Failed)
+			if !cleanupReady {
+				if m.State == Verified {
+					m.State = PartiallyCompleted
+				} else if m.State != PartiallyCompleted {
+					m.State = Failed
+				}
 			}
 			m.Error = result.Error()
 			log.Error("backup failed", "operation", "backup", "error", m.Error)
@@ -208,21 +230,15 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 		if err := m.save(dir); err != nil {
 			result = errors.Join(result, err)
 		}
-		if err := e.writeMetrics(); err != nil {
-			result = errors.Join(result, err)
+		if err := e.writeMetrics(nil); err != nil {
+			log.Warn("unable to publish job metrics", "error", err)
 		}
 	}()
 	if err = m.save(dir); err != nil {
 		return err
 	}
-	if err = m.transition(Running); err != nil {
-		return err
-	}
-	if err = m.save(dir); err != nil {
-		return err
-	}
-	if err = e.writeMetrics(); err != nil {
-		return err
+	if err = e.writeMetrics(nil); err != nil {
+		log.Warn("unable to publish running job metrics", "error", err)
 	}
 	if strings.Contains(effectiveConfig(c)["raw.lxc"], "mount") && !p.AllowExcluded {
 		return errors.New("raw.lxc mount configuration needs an explicit external-data policy")
@@ -324,7 +340,7 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 		return err
 	}
 	resume := func() error {
-		if resumed {
+		if resumed || len(p.Hooks.Resume) == 0 {
 			return nil
 		}
 		rc, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -333,9 +349,7 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 		if er == nil {
 			resumed = true
 			m.NeedsResume = false
-			if er = m.save(dir); er != nil {
-				return er
-			}
+			return m.save(dir)
 		}
 		return er
 	}
@@ -396,9 +410,7 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 		if _, err = l.run(ctx, "snapshot", l.ref(c.Name), id); err != nil {
 			return err
 		}
-		if err = m.transition(SnapshotCreated); err != nil {
-			return err
-		}
+		m.State = SnapshotCreated
 		if len(p.Paths) == 0 {
 			if err = resume(); err != nil {
 				return err
@@ -408,7 +420,7 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 		if err = m.save(dir); err != nil {
 			return err
 		}
-		if _, err = l.run(ctx, "publish", l.ref(c.Name+"/"+id), "--alias", id, "--compression", "none"); err != nil {
+		if _, err = l.run(ctx, "publish", l.ref(c.Name+"/"+id), l.ref(""), "--alias", id, "--compression", "none"); err != nil {
 			return err
 		}
 
@@ -433,25 +445,25 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 		if er = m.save(dir); er != nil {
 			return er
 		}
-		if _, err = l.run(ctx, "image", "export", l.ref(id), filepath.Join(dir, c.Name)); err != nil {
+		stem := filepath.Join(dir, "image-"+id)
+		if _, err = l.run(ctx, "image", "export", l.ref(id), stem); err != nil {
 			return err
 		}
-		files, er := filepath.Glob(filepath.Join(dir, c.Name+"*"))
+		files, er := filepath.Glob(stem + "*")
 		if er != nil {
 			return er
 		}
-		filtered := files[:0]
-		for _, file := range files {
-			if filepath.Base(file) != "manifest.json" {
-				filtered = append(filtered, file)
-			}
-		}
-		files = filtered
 
 		if len(files) == 1 {
 			m.Artifact = files[0]
+			if e.C.Legacy && e.C.Compression == "zstd" {
+				legacyArchive := filepath.Join(dir, c.Name+".tar")
+				if err = os.Rename(m.Artifact, legacyArchive); err != nil {
+					return err
+				}
+				m.Artifact = legacyArchive
+			}
 		} else if len(files) == 2 {
-			stem := filepath.Join(dir, c.Name)
 			meta, root := "", ""
 			for _, file := range files {
 				if file == stem+".root" {
@@ -463,7 +475,7 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 			if meta == "" || root == "" {
 				return errors.New("unrecognized split image layout; artifacts retained")
 			}
-			sum, size, er := checksum(root)
+			sum, size, er := checksum(ctx, root)
 			if er != nil {
 				return er
 			}
@@ -478,7 +490,7 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 		}
 
 	case "incremental":
-		mirror := LXD{R: e.R, Host: p.Mirror}
+		mirror := LXD{Host: p.Mirror}
 		if err = mirror.Detect(ctx); err != nil {
 			return err
 		}
@@ -546,7 +558,7 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 		if _, err = l.run(ctx, "storage", "volume", "export", l.ref(a.Pool), a.Source, path); err != nil {
 			return err
 		}
-		sum, size, er := checksum(path)
+		sum, size, er := checksum(ctx, path)
 		if er != nil {
 			return er
 		}
@@ -561,12 +573,12 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 	}
 	if m.Artifact != "" {
 		if e.C.Compression == "zstd" {
-			if _, err = e.R.Run(ctx, nil, nil, "zstd", "-T1", "--rsyncable", m.Artifact, "-o", m.Artifact+".zst"); err != nil {
+			if _, err = runCommand(ctx, "zstd", "-T1", "--rsyncable", m.Artifact, "-o", m.Artifact+".zst"); err != nil {
 				return err
 			}
 			m.Artifact += ".zst"
 		}
-		m.SHA256, m.Size, err = checksum(m.Artifact)
+		m.SHA256, m.Size, err = checksum(ctx, m.Artifact)
 		if err != nil {
 			return err
 		}
@@ -584,13 +596,12 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 		}
 	}
 	m.StagingPeakBytes = g.peak.Load()
-	if err = m.transition(Exported); err != nil {
-		return err
-	}
+	m.State = Exported
 	if err = m.save(dir); err != nil {
 		return err
 	}
 	paths := append(append([]string{}, m.Paths...), filepath.Join(dir, "manifest.json"))
+	var uploadErrors []error
 	requiredOK := true
 	anyOK := false
 	optionalFailed := false
@@ -610,6 +621,7 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 		}
 		if err != nil {
 			ds.Error = err.Error()
+			uploadErrors = append(uploadErrors, fmt.Errorf("%s: %w", d.Name, err))
 			if ds.Required {
 				requiredOK = false
 			} else {
@@ -627,9 +639,9 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 	}
 	if !requiredOK {
 		if anyOK {
-			_ = m.transition(PartiallyCompleted)
+			m.State = PartiallyCompleted
 		}
-		return errors.New("one or more required repositories failed verification; artifacts retained")
+		return fmt.Errorf("required repository failed verification; artifacts retained: %w", errors.Join(uploadErrors...))
 	}
 	if err = resume(); err != nil {
 		return err
@@ -637,55 +649,52 @@ func (e Engine) backupOne(ctx context.Context, l LXD, c Container, p Policy) (re
 	pc, pcancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	err = e.hooks(pc, l, c, p.Hooks.Post)
 	pcancel()
+	postDone = true
 	if err != nil {
 		return err
 	}
-	postDone = true
-	if err = m.transition(Uploaded); err != nil {
-		return err
-	}
-	if err = m.transition(Verified); err != nil {
-		return err
-	}
-	m.Completed = time.Now().UTC()
-	if err = m.save(dir); err != nil {
-		return err
-	}
-	// Immutable data snapshot contains export metadata. A separate receipt records verified destination IDs.
+	// A receipt records verified data IDs. Keep the local job unfinished
+	// until all receipts have been confirmed.
 	for i, d := range e.C.Destinations {
 		if !m.Destinations[i].Verified {
 			continue
 		}
 		r := e.repo(d)
-		receipt, er := r.backup(ctx, []string{filepath.Join(dir, "manifest.json")}, []string{"lxcer-receipt", "job=" + id, "host=" + m.Host, "instance=" + c.Name})
+		receipt, er := r.backup(ctx, []string{filepath.Join(dir, "manifest.json")}, []string{"lxcer-receipt", "job=" + id, "host=" + m.Host, "instance=" + c.Name, "data=" + m.Destinations[i].SnapshotID})
 		if er == nil {
 			er = r.verify(ctx, receipt, []string{filepath.Join(dir, "manifest.json")})
 		}
 		if er != nil {
+			m.Destinations[i].Error = "catalog receipt: " + er.Error()
 			m.State = PartiallyCompleted
-			return fmt.Errorf("catalog receipt failed: %w", er)
+			return fmt.Errorf("catalog receipt failed for %s: %w", d.Name, er)
 		}
 		m.Destinations[i].ReceiptID = receipt
-	}
-	if err = m.save(dir); err != nil {
-		return err
+		if err = m.save(dir); err != nil {
+			return err
+		}
 	}
 	if optionalFailed {
 		m.State = PartiallyCompleted
-		return errors.New("required destinations verified; optional destinations failed; artifacts retained")
+		return fmt.Errorf("optional repository failed verification; artifacts retained: %w", errors.Join(uploadErrors...))
+	}
+	m.State = Verified
+	if err = m.save(dir); err != nil {
+		return err
 	}
 	if m.Stream != nil {
 		if err = e.commitStream(ctx, p, &m); err != nil {
 			return err
 		}
 	}
-	if err = e.cleanup(ctx, &m, dir, false); err != nil {
+	cleanupReady = true
+	if err = e.cleanup(ctx, &m, dir); err != nil {
 		return err
 	}
 	log.Info("backup verified", "operation", "backup", "size_bytes", m.Size, "strategy", m.Strategy)
 	return nil
 }
-func (e Engine) cleanup(ctx context.Context, m *Manifest, dir string, dry bool) error {
+func (e Engine) cleanup(ctx context.Context, m *Manifest, dir string) error {
 	if m.Legacy {
 		return errors.New("legacy adoption has no job-owned cleanup")
 	}
@@ -695,22 +704,13 @@ func (e Engine) cleanup(ctx context.Context, m *Manifest, dir string, dry bool) 
 	if m.State != Verified {
 		return errors.New("cleanup requires verified job; failure artifacts retained")
 	}
-	required := 0
-	for _, d := range m.Destinations {
-		if d.Required {
-			required++
-			if !d.Verified || d.SnapshotID == "" || d.ReceiptID == "" {
-				return errors.New("required destination has no verified receipt")
-			}
-		}
+	if m.NeedsResume || !m.verificationComplete() {
+		return errors.New("cleanup requires completed resume hooks and verified required receipts")
 	}
-	if required == 0 {
-		return errors.New("cleanup requires a verified required repository")
+	if err := privateDir(dir); err != nil {
+		return err
 	}
-	if dry {
-		return nil
-	}
-	l := LXD{R: e.R, Host: sourceRemote(*m)}
+	l := LXD{Host: sourceRemote(*m)}
 	if m.Snapshot != "" {
 		if m.Snapshot != m.ID {
 			return errors.New("snapshot ownership mismatch")
@@ -719,11 +719,24 @@ func (e Engine) cleanup(ctx context.Context, m *Manifest, dir string, dry bool) 
 		if m.Capabilities.InstanceEndpoint {
 			endpoint = "instances"
 		}
-		b, err := l.run(ctx, "query", l.ref("/1.0/"+endpoint+"/"+m.Instance.Name+"/snapshots"))
+		path := "/1.0/" + endpoint + "/" + m.Instance.Name + "/snapshots"
+		b, err := l.run(ctx, "query", l.ref(path))
 		if err != nil {
 			return err
 		}
-		if strings.Contains(string(b), "/"+m.ID+`"`) {
+		if b, err = unwrapAPI(b); err != nil {
+			return err
+		}
+		var snapshots []string
+		if err = json.Unmarshal(b, &snapshots); err != nil {
+			return err
+		}
+		// The server can return a project query parameter or the legacy resource path.
+		for _, snapshot := range snapshots {
+			resource, _, _ := strings.Cut(snapshot, "?")
+			if !strings.HasSuffix(resource, "/"+m.Instance.Name+"/snapshots/"+m.ID) {
+				continue
+			}
 			if _, err = l.run(ctx, "delete", l.ref(m.Instance.Name+"/"+m.ID)); err != nil {
 				return err
 			}
@@ -737,7 +750,16 @@ func (e Engine) cleanup(ctx context.Context, m *Manifest, dir string, dry bool) 
 		if err != nil {
 			return err
 		}
-		if strings.Contains(string(b), `"`+m.ID+`"`) {
+		var aliases []struct {
+			Name string `json:"name"`
+		}
+		if err = json.Unmarshal(b, &aliases); err != nil {
+			return err
+		}
+		for _, alias := range aliases {
+			if alias.Name != m.ID {
+				continue
+			}
 			if _, err = l.run(ctx, "image", "alias", "delete", l.ref(m.ID)); err != nil {
 				return err
 			}
@@ -754,6 +776,14 @@ func (e Engine) cleanup(ctx context.Context, m *Manifest, dir string, dry bool) 
 		}
 		if f.IsDir() {
 			return errors.New("unexpected directory in job staging")
+		}
+	}
+	for _, f := range files {
+		if f.Name() == "manifest.json" {
+			continue
+		}
+		if err = ctx.Err(); err != nil {
+			return err
 		}
 		if err = os.Remove(filepath.Join(dir, f.Name())); err != nil {
 			return err

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,26 +12,57 @@ import (
 	"time"
 )
 
-// Textfile metrics are recomputed from durable manifests, including interrupted jobs.
-func (e Engine) writeMetrics() error {
+type backupRun struct {
+	Started   time.Time `json:"started"`
+	Completed time.Time `json:"completed"`
+	Success   bool      `json:"success"`
+}
+
+// Textfile metrics are recomputed from durable manifests and the latest completed invocation.
+func (e Engine) writeMetrics(run *backupRun) error {
 	if e.C.MetricsFile == "" {
 		return nil
+	}
+	if err := privateDir(e.C.StateDir); err != nil {
+		return err
 	}
 	lock, err := acquireLockMode(e.C.StateDir, "metrics", true)
 	if err != nil {
 		return err
 	}
 	defer releaseLock(lock)
-	jobs, err := filepath.Glob(filepath.Join(e.C.StateDir, "lxcer-*", "manifest.json"))
+	runPath := filepath.Join(e.C.StateDir, "backup-run.json")
+	var lastRun backupRun
+	if b, err := os.ReadFile(runPath); err == nil {
+		if err := json.Unmarshal(b, &lastRun); err != nil {
+			return fmt.Errorf("read backup run status: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if run != nil && run.Started.After(lastRun.Started) {
+		b, err := json.Marshal(run)
+		if err != nil {
+			return err
+		}
+		if err := atomicWrite(runPath, b); err != nil {
+			return err
+		}
+		lastRun = *run
+	}
+	jobs, err := manifestPaths(e.C.StateDir)
 	if err != nil {
 		return err
 	}
 	type series struct {
 		latest       Manifest
+		restore      *RestoreTest
 		success      time.Time
 		failures     int
 		verification int
-		running      int
+		unfinished   int
+		lastStarted  time.Time
+		remote       string
 	}
 	groups := map[string]*series{}
 	for _, path := range jobs {
@@ -43,73 +76,139 @@ func (e Engine) writeMetrics() error {
 			g = &series{}
 			groups[key] = g
 		}
+		if m.RestoreTest != nil && (g.restore == nil || m.RestoreTest.Time.After(g.restore.Time)) {
+			g.restore = m.RestoreTest
+		}
+		if m.Legacy {
+			continue
+		}
+		if m.Completed.IsZero() {
+			g.unfinished++
+			if m.Started.After(g.lastStarted) {
+				g.lastStarted = m.Started
+				g.remote = sourceRemote(m)
+			}
+			continue
+		}
 		if m.Started.After(g.latest.Started) {
 			g.latest = m
 		}
-		if m.State == Verified && m.Completed.After(g.success) {
-			g.success = m.Completed
-		}
-		if m.State == Failed || m.State == PartiallyCompleted {
+		if m.State == Verified && m.Error == "" && !m.NeedsResume && m.verificationComplete() {
+			if m.Completed.After(g.success) {
+				g.success = m.Completed
+			}
+		} else {
 			g.failures++
 		}
 		for _, d := range m.Destinations {
-			if !d.Verified {
+			if !d.Verified || (d.Error != "" && !snapshotID(d.ReceiptID)) {
 				g.verification++
 			}
 		}
-		if m.Completed.IsZero() {
-			g.running++
-		}
 	}
-	var b strings.Builder
-	types := map[string]string{"lxcer_backup_upload_bytes": "gauge", "lxcer_backup_capture_duration_seconds": "gauge", "lxcer_backup_staging_peak_bytes": "gauge", "lxcer_backup_chain_length": "gauge", "lxcer_backup_success": "gauge", "lxcer_backup_last_success_timestamp_seconds": "gauge", "lxcer_backup_duration_seconds": "gauge", "lxcer_backup_size_bytes": "gauge", "lxcer_backup_failures_total": "counter", "lxcer_backup_jobs_running": "gauge", "lxcer_backup_verification_failures_total": "counter", "lxcer_restore_test_success": "gauge", "lxcer_restore_test_duration_seconds": "gauge"}
-	keys := make([]string, 0, len(types))
-	for k := range types {
-		keys = append(keys, k)
+	type sample struct {
+		labels string
+		value  string
+	}
+	samples := map[string][]sample{}
+	add := func(name, labels string, value any) {
+		samples[name] = append(samples[name], sample{labels: labels, value: fmt.Sprint(value)})
+	}
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	for _, k := range keys {
-		fmt.Fprintf(&b, "# HELP %s lxcer durable catalog metric\n# TYPE %s %s\n", k, k, types[k])
-	}
-	label := func(m Manifest) string {
-		return `{host=` + strconv.Quote(m.Host) + `,instance=` + strconv.Quote(m.Instance.Name) + `}`
-	}
-	for _, g := range groups {
+	for _, key := range keys {
+		g := groups[key]
+		host, instance, _ := strings.Cut(key, "/")
+		labels := "host=" + strconv.Quote(host) + ",instance=" + strconv.Quote(instance)
+		if g.restore != nil {
+			add("restore_test_success", labels, metricBool(g.restore.Success))
+			add("restore_test_duration_seconds", labels, g.restore.Duration)
+		}
 		m := g.latest
-		l := label(m)
-		fmt.Fprintf(&b, "lxcer_backup_capture_duration_seconds%s %g\nlxcer_backup_staging_peak_bytes%s %d\n", l, m.CaptureSeconds, l, m.StagingPeakBytes)
+		if !m.Completed.IsZero() || g.unfinished > 0 {
+			running := 0
+			if g.unfinished > 0 && g.lastStarted.After(m.Started) {
+				lock, err := acquireLock(e.C.StateDir, g.remote+"/"+instance)
+				if errors.Is(err, errJobLocked) {
+					running = 1
+				} else if err != nil {
+					return err
+				}
+				releaseLock(lock)
+			}
+			add("backup_jobs_running", labels, running)
+			add("backup_jobs_interrupted", labels, g.unfinished-running)
+		}
+		if m.Completed.IsZero() {
+			continue
+		}
+
+		add("backup_capture_duration_seconds", labels, m.CaptureSeconds)
+		add("backup_staging_peak_bytes", labels, m.StagingPeakBytes)
 		chain := 0
 		if m.Stream != nil {
 			chain = len(m.Stream.Parents) + 1
 		}
-		fmt.Fprintf(&b, "lxcer_backup_chain_length%s %d\n", l, chain)
+		add("backup_chain_length", labels, chain)
 		for _, d := range m.Destinations {
-			dl := strings.TrimSuffix(l, "}") + ",destination=" + strconv.Quote(d.Name) + "}"
-			fmt.Fprintf(&b, "lxcer_backup_upload_bytes%s %d\n", dl, d.UploadBytes)
+			add("backup_upload_bytes", labels+",destination="+strconv.Quote(d.Name), d.UploadBytes)
 		}
-		success := 0
-		if m.State == Verified {
-			success = 1
-		}
-		ts := int64(0)
+		verified := !m.NeedsResume && m.verificationComplete()
+		add("backup_required_destinations_verified", labels, metricBool(verified))
+		add("backup_success", labels, metricBool(m.State == Verified && m.Error == "" && verified))
+		lastSuccess := int64(0)
 		if !g.success.IsZero() {
-			ts = g.success.Unix()
+			lastSuccess = g.success.Unix()
 		}
-		duration := float64(0)
-		if !m.Completed.IsZero() {
-			duration = m.Completed.Sub(m.Started).Seconds()
+		add("backup_last_success_timestamp_seconds", labels, lastSuccess)
+		add("backup_duration_seconds", labels, m.Completed.Sub(m.Started).Seconds())
+		size := m.Size
+		for _, part := range m.ImageParts {
+			size += part.Size
 		}
-		fmt.Fprintf(&b, "lxcer_backup_success%s %d\nlxcer_backup_last_success_timestamp_seconds%s %d\nlxcer_backup_duration_seconds%s %g\nlxcer_backup_size_bytes%s %d\nlxcer_backup_failures_total%s %d\nlxcer_backup_jobs_running%s %d\nlxcer_backup_verification_failures_total%s %d\n", l, success, l, ts, l, duration, l, m.Size, l, g.failures, l, g.running, l, g.verification)
-		if m.RestoreTest != nil {
-			v := 0
-			if m.RestoreTest.Success {
-				v = 1
-			}
-			fmt.Fprintf(&b, "lxcer_restore_test_success%s %d\nlxcer_restore_test_duration_seconds%s %g\n", l, v, l, m.RestoreTest.Duration)
+		for _, volume := range m.Volumes {
+			size += volume.Size
 		}
+		if size > 0 {
+			add("backup_size_bytes", labels, size)
+		}
+		add("backup_failures_total", labels, g.failures)
+		add("backup_verification_failures_total", labels, g.verification)
 	}
-	if _, err = os.Stat(filepath.Dir(e.C.MetricsFile)); err != nil {
-		return err
+
+	if !lastRun.Completed.IsZero() {
+		add("backup_run_success", "", metricBool(lastRun.Success))
+		add("backup_run_last_completion_timestamp_seconds", "", lastRun.Completed.Unix())
+	}
+	names := make([]string, 0, len(samples))
+	for name := range samples {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, name := range names {
+		kind := "gauge"
+		if strings.HasSuffix(name, "_total") {
+			kind = "counter"
+		}
+		fmt.Fprintf(&b, "# HELP lxcer_%s lxcer %s.\n# TYPE lxcer_%s %s\n", name, strings.ReplaceAll(name, "_", " "), name, kind)
+		for _, s := range samples[name] {
+			if s.labels == "" {
+				fmt.Fprintf(&b, "lxcer_%s %s\n", name, s.value)
+			} else {
+				fmt.Fprintf(&b, "lxcer_%s{%s} %s\n", name, s.labels, s.value)
+			}
+		}
 	}
 	return atomicWriteMode(e.C.MetricsFile, []byte(b.String()), 0644)
+}
+
+func metricBool(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }

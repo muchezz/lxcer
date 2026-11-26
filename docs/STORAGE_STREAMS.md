@@ -40,17 +40,4 @@ A test restore requires a separate explicitly isolated host and a root-only prof
 
 Per-job measurements include archive/stream bytes, capture duration, staging peak, parent count and Restic `data_added_packed` per destination. Packed data bytes exclude transport protocol overhead. Driver-reported referenced/exclusive snapshot bytes are recorded when available; `-1` means unavailable. Btrfs extent accounting can add metadata scanning time. The receiver/import path necessarily materializes a root/image during recovery; incremental capture does not make recovery free of full-data work.
 
-The command-model tests deliberately generate a 32 KiB base and 1 KiB delta; those are simulation sizes, not filesystem performance claims. Real timing/space/transfer measurements require the guarded kernel harness below. No real Btrfs/ZFS delta reduction was verified in the development environment.
-
-## Disposable protocol harness
-
-```sh
-LXCER_TEST_DISPOSABLE=YES \
-LXCER_TEST_STORAGE_DRIVER=btrfs \
-LXCER_TEST_STREAM_PARENT=/mnt/btrfs/lxcer-test-streams \
-go test -tags=storageintegration -run '^TestRealStorageStreamRoundTrip$' -v ./...
-```
-
-For ZFS use a disposable parent dataset such as `tank/lxcer-test-streams`. The harness creates only a random child/subvolume, captures 8 MiB of disposable random data, changes 4 KiB in place, receives the chain through Restic and verifies its recovered image payload. It reports stream sizes, packed upload, capture and restore duration. LXD import is modeled in this protocol harness; separately run the real LXD matrix to qualify the daemon/storage combination. Unconfigured runs skip as NOT VERIFIED; explicitly enabled runs with invalid prerequisites fail. Manual CI workflows require the protected disposable environment/runner. Reset that environment after reviewing retained failure resources.
-
-References: [Btrfs send](https://btrfs.readthedocs.io/en/latest/btrfs-send.html), [Btrfs receive](https://btrfs.readthedocs.io/en/latest/btrfs-receive.html), [ZFS send](https://openzfs.github.io/openzfs-docs/man/master/8/zfs-send.8.html), [ZFS receive](https://openzfs.github.io/openzfs-docs/man/master/8/zfs-receive.8.html), [LXD image format](https://canonical.com/lxd/docs/latest/reference/image_format/).
+Validate full and incremental capture, replay, and application recovery on a disposable filesystem matching the intended source. Measure stream size and staging use on that filesystem before setting storage limits.

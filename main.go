@@ -23,9 +23,6 @@ var buildDate = "unknown"
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 func run(args []string, out, errOut io.Writer) int {
-	return runWithRunner(args, out, errOut, ExecRunner{})
-}
-func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 	legacyFlags := len(args) > 0 && strings.HasPrefix(args[0], "-")
 	f := flag.NewFlagSet("lxcer", flag.ContinueOnError)
 	f.SetOutput(errOut)
@@ -81,9 +78,18 @@ func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 		return 0
 	}
 	var lv slog.Level
-	if err := lv.UnmarshalText([]byte(*level)); err != nil {
-		fmt.Fprintln(errOut, "invalid log level")
-		return 2
+	switch strings.ToLower(*level) {
+	case "warning":
+		lv = slog.LevelWarn
+	case "trace":
+		lv = slog.LevelDebug
+	case "fatal", "panic":
+		lv = slog.LevelError
+	default:
+		if err := lv.UnmarshalText([]byte(*level)); err != nil {
+			fmt.Fprintln(errOut, "invalid log level")
+			return 2
+		}
 	}
 	opts := &slog.HandlerOptions{Level: lv}
 	var handler slog.Handler
@@ -129,15 +135,18 @@ func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 		selectedHost = "local"
 	}
 	if selectedHost != "" {
-		h := Host{Name: selectedHost, Workers: 1}
+		h := Host{Name: selectedHost, Workers: c.Workers}
 		for _, x := range hosts {
 			if x.Name == selectedHost {
 				h = x
 			}
 		}
+		if *local {
+			h.SSH = ""
+		}
 		hosts = []Host{h}
 	}
-	e := Engine{C: c, R: runner, Log: log}
+	e := Engine{C: c, Log: log}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	ctx, stop := context.WithTimeout(ctx, c.Timeout)
@@ -151,13 +160,10 @@ func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 	}
 	switch *action {
 	case "backup":
-		if len(hosts) == 0 {
-			return fail(errors.New("no hosts selected; use -local or inventory"))
-		}
-		err = e.Backup(ctx, hosts, *name)
+		err = e.backup(ctx, hosts, *name, *concurrent)
 	case "capabilities":
 		for _, h := range hosts {
-			l := LXD{R: e.R, Host: h.Name}
+			l := LXD{Host: h.Name}
 			if err = l.Detect(ctx); err != nil {
 				break
 			}
@@ -169,7 +175,7 @@ func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 		}
 	case "list":
 		var files []string
-		files, err = filepath.Glob(filepath.Join(c.StateDir, "lxcer-*", "manifest.json"))
+		files, err = manifestPaths(c.StateDir)
 		if err == nil {
 			for _, path := range files {
 				b, er := os.ReadFile(path)
@@ -219,8 +225,11 @@ func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 			matched++
 			d, er := e.destination(s.Name)
 			if er == nil {
-				paths := m.Paths
-				er = e.repo(d).verify(ctx, s.SnapshotID, paths)
+				r := e.repo(d)
+				er = r.verify(ctx, s.SnapshotID, m.Paths)
+				if er == nil && s.ReceiptID != "" {
+					_, er = r.snapshot(ctx, s.ReceiptID)
+				}
 			}
 			err = errors.Join(err, er)
 		}
@@ -266,6 +275,9 @@ func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 				}
 			}
 		}
+		if restoreDestination == "" && len(c.Destinations) == 1 {
+			restoreDestination = c.Destinations[0].Name
+		}
 		legacyRestore := legacyFlags && c.Legacy
 		o := RestoreOptions{ReceiveDataset: *receiveDataset, Start: legacyRestore && !*stopped, RestoreVolumes: *restoreVolumes, Name: *as, Host: selectedHost, Destination: restoreDestination, Snapshot: *snapshot, Pool: *pool, Networks: ns, DryRun: *action == "restore-plan", Test: *action == "restore-test", Isolated: *isolated, Profile: *profile, Health: argv, NativeTarget: *nativeTarget}
 
@@ -296,7 +308,7 @@ func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 			job := m
 			if jobPath == "" {
 				var lookupErr error
-				job, jobPath, lookupErr = e.findManifest(source, *sourceHost)
+				job, jobPath, lookupErr = e.findManifest(source, *sourceHost, restoreDestination, *snapshot)
 				if lookupErr != nil {
 					if legacyRestore && *action == "restore" && *sourceHost == "" && errors.Is(lookupErr, errNoCatalog) {
 						if *pool != "" || *networks != "" || *restoreVolumes {
@@ -320,17 +332,22 @@ func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 			options.Name = to
 			er := e.restore(ctx, &job, options)
 			if *action == "restore-test" && job.RestoreTest != nil {
-				er = errors.Join(er, job.save(filepath.Dir(jobPath)))
+				er = errors.Join(er, e.saveRestoreTest(jobPath, job))
 			}
 			if er != nil {
 				return er
 			}
-			state := "stopped"
-			if options.Start {
-				state = "started"
-			}
 			restoreMu.Lock()
-			fmt.Fprintf(out, "%s: %s -> %s:%s (%s)\n", *action, source, selectedHost, to, state)
+			switch {
+			case options.NativeTarget != "":
+				fmt.Fprintf(out, "%s: %s -> %s\n", *action, source, options.NativeTarget)
+			case options.DryRun || options.Test:
+				fmt.Fprintf(out, "%s: %s -> %s:%s\n", *action, source, selectedHost, to)
+			case options.Start:
+				fmt.Fprintf(out, "%s: %s -> %s:%s (started)\n", *action, source, selectedHost, to)
+			default:
+				fmt.Fprintf(out, "%s: %s -> %s:%s (stopped)\n", *action, source, selectedHost, to)
+			}
 			restoreMu.Unlock()
 			return nil
 		}
@@ -349,7 +366,7 @@ func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 				defer func() { <-slots }()
 				if er := restoreSingle(source, to); er != nil {
 					restoreMu.Lock()
-					restoreErrors = append(restoreErrors, er)
+					restoreErrors = append(restoreErrors, fmt.Errorf("restore %s as %s: %w", source, to, er))
 					restoreMu.Unlock()
 				}
 			}(source, to)
@@ -358,22 +375,41 @@ func runWithRunner(args []string, out, errOut io.Writer, runner Runner) int {
 
 		err = errors.Join(restoreErrors...)
 		if *action == "restore-test" {
-			err = errors.Join(err, e.writeMetrics())
+			err = errors.Join(err, e.writeMetrics(nil))
 		}
 
 	case "cleanup", "recover":
-		err = e.recoverJobs(ctx, *execute)
+		err = e.recoverJobs(ctx, out, *execute)
 		if *execute {
-			err = errors.Join(err, e.writeMetrics())
+			err = errors.Join(err, e.writeMetrics(nil))
 		}
 	case "retention":
 		var d Destination
 		d, err = e.destination(*dest)
 		if err == nil {
-			if selectedHost == "" || *name == "" {
+			scope := selectedHost
+			if *sourceHost != "" {
+				scope = *sourceHost
+			} else if *local && c.HostID != "" {
+				scope = c.HostID
+			}
+			if !validName(scope) || *name == "" {
 				err = errors.New("retention requires explicit host and container scope")
 			} else {
-				err = e.repo(d).chainRetention(ctx, selectedHost, *name, !*execute)
+				var ids []string
+				ids, err = e.repo(d).chainRetention(ctx, scope, *name, *execute)
+				if err == nil {
+					if len(ids) == 0 {
+						fmt.Fprintln(out, "no snapshots eligible for retention")
+					}
+					for _, id := range ids {
+						if *execute {
+							fmt.Fprintln(out, "forgot snapshot", id)
+						} else {
+							fmt.Fprintln(out, "would forget snapshot", id)
+						}
+					}
+				}
 			}
 		}
 	default:

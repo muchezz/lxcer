@@ -51,7 +51,7 @@ restic snapshots --json --tag lxcer-receipt
   -snapshot RECEIPT_SNAPSHOT_ID -target /private/new-catalog-recovery
 ```
 
-The recovered manifest includes data snapshot IDs and original archive paths. Pass its actual recovered pathname to `-manifest`. Export-time sidecars in `lxcer-data` snapshots remain useful if receipt upload was interrupted. They lack final verification receipts; select and verify an exact data snapshot manually. Receipt snapshots are retained as catalog history even when scoped data retention expires an old archive; a historical receipt alone does not prove the data snapshot still exists.
+Receipt manifests record verified data IDs and original archive paths. Receipts created while a backup is finalizing may show its export state. The destination records still identify verified data snapshots. Pass its actual recovered pathname to `-manifest`. Export-time sidecars in `lxcer-data` snapshots remain useful if receipt upload was interrupted. They lack final verification receipts; select and verify an exact data snapshot manually. Receipt snapshots are retained as catalog history even when scoped data retention expires an old archive; a historical receipt alone does not prove the data snapshot still exists.
 
 For modern commands that need explicit metadata, pool/network mapping or catalog integration with old `.tar.zst` archives, use `discover -legacy`, obtain a JSON instance object (for example a saved object from `lxc list --format json`), then adopt it:
 
@@ -65,4 +65,4 @@ Adoption restores/verifies the old archive, records its checksum and supplied me
 
 ## Interruption and recovery
 
-`cleanup` and `recover` default to preview. `recover -execute` acquires instance locks, runs persisted best-effort resume hooks for interrupted quiescence, marks unfinished jobs failed, and retries cleanup only for Verified jobs with verified required receipts. A SIGTERM cancels work but allows bounded resume handling. SIGKILL/power loss requires running recovery before scheduling another backup; no program can execute resume hooks while its host is down. Failed staging remains available; never delete it solely because an upload command exited zero.
+`cleanup` and `recover` default to preview. `recover -execute` acquires instance locks, runs persisted best-effort resume hooks for interrupted quiescence, marks unfinished jobs failed, and retries cleanup for Verified jobs after rechecking their data snapshots and receipts. A SIGTERM cancels work but allows bounded resume handling. SIGKILL/power loss requires running recovery before scheduling another backup; no program can execute resume hooks while its host is down. Failed staging remains available; never delete it solely because an upload command exited zero.

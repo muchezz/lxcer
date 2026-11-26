@@ -22,7 +22,15 @@ func (e Engine) restoreLegacy(ctx context.Context, source, target, host, destina
 		return err
 	}
 	r := e.repo(d)
-	l := LXD{R: e.R, Host: host}
+	l := LXD{Host: host}
+	if err = privateDir(e.C.StateDir); err != nil {
+		return err
+	}
+	lock, err := acquireLock(e.C.StateDir, host+"/"+target)
+	if err != nil {
+		return err
+	}
+	defer releaseLock(lock)
 	cc, err := l.List(ctx)
 	if err != nil {
 		return err
@@ -32,14 +40,6 @@ func (e Engine) restoreLegacy(ctx context.Context, source, target, host, destina
 			return errors.New("restore collision: instance already exists")
 		}
 	}
-	if err = privateDir(e.C.StateDir); err != nil {
-		return err
-	}
-	lock, err := acquireLock(e.C.StateDir, host+"/"+target)
-	if err != nil {
-		return err
-	}
-	defer releaseLock(lock)
 	args := []string{"snapshots", "--json"}
 	if id != "" {
 		if !snapshotID(id) {
@@ -51,11 +51,7 @@ func (e Engine) restoreLegacy(ctx context.Context, source, target, host, destina
 	if err != nil {
 		return err
 	}
-	var snapshots []struct {
-		ID    string    `json:"id"`
-		Time  time.Time `json:"time"`
-		Paths []string  `json:"paths"`
-	}
+	var snapshots []repositorySnapshot
 	if err = json.Unmarshal(b, &snapshots); err != nil {
 		return err
 	}
@@ -101,21 +97,30 @@ func (e Engine) restoreLegacy(ctx context.Context, source, target, host, destina
 			result = os.RemoveAll(dir)
 		}
 	}()
-	if _, err = r.run(ctx, "restore", id, "--target", dir, "--include", artifact, "--verify"); err != nil {
+	ctx, guard, stop := e.guard(ctx, dir)
+	defer stop()
+	defer func() { result = errors.Join(result, context.Cause(ctx)) }()
+	if err = guard.check(); err != nil {
+		return err
+	}
+	if err = r.restorePath(ctx, id, dir, artifact); err != nil {
 		return err
 	}
 	restored := filepath.Join(dir, strings.TrimPrefix(filepath.Clean(artifact), "/"))
-	if _, _, err = checksum(restored); err != nil {
+	if _, _, err = checksum(ctx, restored); err != nil {
 		return err
 	}
 	tar := filepath.Join(dir, source+".tar")
-	if _, err = e.R.Run(ctx, nil, nil, "zstd", "-d", "-T1", restored, "-o", tar); err != nil {
+	if _, err = runCommand(ctx, "zstd", "-d", "-T1", restored, "-o", tar); err != nil {
+		return err
+	}
+	if err = guard.check(); err != nil {
 		return err
 	}
 	if _, err = l.run(ctx, "image", "import", tar, l.ref(""), "--alias", job); err != nil {
 		return err
 	}
-	if _, err = l.run(ctx, "init", l.ref(job), l.ref(target), "-c", "user.lxcer.restore="+job); err != nil {
+	if _, err = l.run(ctx, "init", l.ref(job), l.ref(target), "-c", "boot.autostart=false", "-c", "user.lxcer.restore="+job); err != nil {
 		return err
 	}
 	cc, err = l.List(ctx)
