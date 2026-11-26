@@ -5,10 +5,10 @@ The original lxcer is by pavel1337 and its contributors.
 Upstream source and attribution: https://github.com/pavel1337/lxcer
 The original module path is github.com/pavel1337/lxcer.
 
-The upstream repository and its published tags contain no project license
-grant identified during this qualification. This notice grants no rights
-to redistribute lxcer. Obtain authorization from the upstream rights
-holders before distributing the source or binaries.
+The original author granted muchezz/lxcer permission to maintain this fork
+and publicly redistribute its modified source and compiled binaries. The
+upstream project has no general license grant identified, and this notice
+does not assign a project-wide license. Dependency licenses apply separately.
 
 The release build includes the Go runtime and gopkg.in/yaml.v3. Their
 license and copyright notices are included in the release's licenses/

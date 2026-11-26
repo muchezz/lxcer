@@ -108,4 +108,4 @@ This project originated as a fork of pavel1337/lxcer. This independently maintai
 
 [Original lxcer repository](https://github.com/pavel1337/lxcer)
 
-No upstream project license grant has been identified. Obtain authorization from the upstream rights holders before redistributing the source or binaries. [Project and dependency notices](NOTICE) · [Redistribution details](docs/DEVELOPMENT.md#redistribution)
+The original author authorized this fork to publicly redistribute its modified source and compiled binaries. The upstream project has no identified general license grant. [Project and dependency notices](NOTICE) · [Redistribution details](docs/DEVELOPMENT.md#redistribution)

@@ -25,7 +25,7 @@ test -z "$(git status --porcelain)" &&
   (cd dist/v0.4.0-rc.1 && sha256sum -c SHA256SUMS)
 ```
 
-The script uses the toolchain pinned in `go.mod` and builds static Linux AMD64 and ARM64 binaries. Each binary embeds the requested version, source commit, and commit date. A local build from a modified checkout appends `-dirty` to the commit metadata. The output includes the checksums, changelog, [project attribution](../NOTICE), and Go and YAML license notices. The GitHub workflow requires a clean checkout and uploads workflow artifacts only when redistribution has been approved and `LXCER_REDISTRIBUTION_APPROVED=true`.
+The script uses the toolchain pinned in `go.mod` and builds static Linux AMD64 and ARM64 binaries. Each binary embeds the requested version, source commit, and commit date. A local build from a modified checkout appends `-dirty` to the commit metadata. The output includes the checksums, changelog, [project attribution](../NOTICE), and Go and YAML license notices. The manually triggered GitHub workflow builds from a clean checkout and uploads the bundle as workflow artifacts.
 
 ## Upgrade and roll back
 
@@ -43,4 +43,4 @@ For rollback, pause scheduling and use the candidate's `recover` command to insp
 
 ## Redistribution
 
-No project license grant has been identified in the original repository or its published tags. Obtain written permission or a license from the upstream rights holders before distributing source or binaries. Preserve the original authorship, module path, and dependency notices included in the build bundle. [Original lxcer repository](https://github.com/pavel1337/lxcer) · [GitHub licensing guidance](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository)
+The original author granted this fork permission to maintain lxcer and publicly redistribute its modified source and compiled binaries. The upstream repository and its historical tags have no identified general project license grant. Preserve the original authorship, module path, and dependency notices included in the build bundle. [Original lxcer repository](https://github.com/pavel1337/lxcer) · [GitHub licensing guidance](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository)
